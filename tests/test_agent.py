@@ -181,7 +181,7 @@ def test_agent_isolates_downloads_and_packages_only_successes(tmp_path):
         assert archive.read("good.pdf") == b"%PDF-content"
     assert not client.destination.exists()
     assert "I couldn't retrieve 1 requested document" in email.replies[0][1]
-    assert "I've attached the retrieved document" in email.replies[0][1]
+    assert "and attached one in a ZIP file" in email.replies[0][1]
 
 
 @pytest.mark.parametrize("available, failed", [(6, False), (0, False), (6, True)])

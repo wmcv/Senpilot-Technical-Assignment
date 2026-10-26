@@ -651,6 +651,7 @@ class EmailClient:
         matter_id: str | None = None,
         document_type: DocumentType | None = None,
         errors: tuple[DocumentError, ...] = (),
+        available_count: int | None = None,
     ) -> tuple[PreparedReply, ...]:
         """Prepare complete messages; prefer one, then first-fit decreasing ZIP groups.
 
@@ -665,7 +666,21 @@ class EmailClient:
         signoff = "\n\nBest,\nSenpilot Document Agent"
         failures: tuple[DocumentError, ...] = ()
 
-        def body(index, total, members, deliverable):
+        words = (
+            "zero",
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+            "ten",
+        )
+
+        def body(index, total, members, deliverable, zip_count=0):
             unit = "document" if members == 1 else "documents"
             if index > 1:
                 sentence = (
@@ -676,6 +691,43 @@ class EmailClient:
                 )
                 return f"Hi,\n\n{sentence}{signoff}"
             text = summary.removesuffix(signoff)
+            label = category.removesuffix("s") if available_count == 1 else category
+            sentence = f"I retrieved {len(files)}"
+            sentence += (
+                f" of the {available_count} {label}" if available_count is not None else f" {label}"
+            )
+            if members:
+                archives = (
+                    "in a ZIP file" if zip_count == 1 else (f"across {words[zip_count]} ZIP files")
+                )
+                sentence += f" and attached {words[members]} {archives}."
+            elif total == 1:
+                sentence += ", but none could be attached."
+            else:
+                sentence += "."
+            oversized = sum(
+                error.error == "exceeds safe encoded message limit" for error in failures
+            )
+            if oversized and oversized == len(failures):
+                if total == 1 and members and oversized == len(files) - members:
+                    subject = f"The remaining {words[oversized]}"
+                else:
+                    noun = "document" if oversized == 1 else "documents"
+                    subject = f"{words[oversized].capitalize()} {noun}"
+                sentence += f" {subject} exceeded the email attachment limit."
+            elif failures:
+                noun = "document" if len(failures) == 1 else "documents"
+                sentence += f" {words[len(failures)].capitalize()} {noun} could not be included"
+                if oversized:
+                    sentence += (
+                        f", including {words[oversized]} that exceeded the email attachment limit"
+                    )
+                sentence += "."
+            previous_sentence = f"I retrieved {len(files)} of {available_count} {category}."
+            if available_count is not None and previous_sentence in text.splitlines():
+                text = text.replace(previous_sentence, sentence, 1)
+            else:
+                text += "\n\n" + sentence
             if total > 1:
                 included = (
                     f"all {deliverable} retrieved documents"
@@ -684,8 +736,6 @@ class EmailClient:
                 )
                 if members:
                     text += f"\n\nI'll send {included} across {total} separate replies."
-                    amount = "document" if members == 1 else f"{members} documents"
-                    text += f" I've attached the first {amount} to this email."
                 else:
                     following = (
                         "a separate reply" if total == 2 else f"{total - 1} separate replies"
@@ -693,39 +743,18 @@ class EmailClient:
                     text += (
                         f"\n\nI can send {included}. The attachments will follow in {following}."
                     )
-            elif members:
-                if members == len(files):
-                    amount = (
-                        "the retrieved document"
-                        if members == 1
-                        else (f"all {members} retrieved documents")
-                    )
-                    text += f"\n\nI've attached {amount}."
-                else:
-                    text += f"\n\nI've attached {members} of the {len(files)} retrieved documents."
-            else:
-                text += "\n\nNone of the retrieved documents could be included."
-            oversized = sum(
-                error.error == "exceeds safe encoded message limit" for error in failures
-            )
-            if oversized and oversized == len(failures):
-                noun = "document" if oversized == 1 else "documents"
-                text += (
-                    f" {oversized} {noun} exceeded the email attachment limit "
-                    "and couldn't be included."
-                )
-            elif failures:
-                noun = "document" if len(failures) == 1 else "documents"
-                text += f" {len(failures)} {noun} could not be included"
-                if oversized:
-                    text += f", including {oversized} that exceeded the email attachment limit"
-                text += "."
             return text + signoff
 
         def message(group, index, total, deliverable):
             return build_reply(
                 original,
-                body(index, total, sum(len(batch.filenames) for batch in group), deliverable),
+                body(
+                    index,
+                    total,
+                    sum(len(batch.filenames) for batch in group),
+                    deliverable,
+                    len(group),
+                ),
                 mailbox,
                 tuple(batch.archive for batch in group),
                 part=(index, total),

@@ -467,7 +467,7 @@ def test_complete_mocked_workflow_preserves_zip_and_failures(
         )
     )
     body = reply.get_body().get_content()
-    assert "I retrieved 1 of 5 Key Documents" in body
+    assert "I retrieved 1 of the 5 Key Documents" in body
     assert "I couldn't retrieve 1 requested document" in body
     attachments = list(reply.iter_attachments())
     if oversized:
@@ -575,6 +575,7 @@ def prepare_small_parts(client, tmp_path, monkeypatch, count=3):
         tmp_path / "zip",
         matter_id="M12205",
         document_type=DocumentType.EXHIBITS,
+        available_count=13,
     )
     assert len(parts) == count
     return parts, files
@@ -599,9 +600,9 @@ def test_multipart_mime_size_threading_receipts_and_counts(client, service, tmp_
         assert message["References"] == "<ancestor@example.net> <original@example.net>"
         body = message.get_body().get_content()
         if index == 1:
-            assert "I retrieved 3 of 13 Exhibits" in body
+            assert "I retrieved 3 of the 13 Exhibits" in body
             assert "all 3 retrieved documents across 3 separate replies" in body
-            assert "I've attached the first document" in body
+            assert "and attached one in a ZIP file" in body
         else:
             assert "database" not in body.lower()
             assert "retrieved" not in body.lower()
@@ -669,10 +670,10 @@ def test_unfit_and_invalid_pdfs_reported_without_blocking_other_files(
     message = decode_reply(parts[0].raw)
     assert len(list(message.iter_attachments())) == 1
     body = message.get_body().get_content()
-    assert "1 of the 4 retrieved documents" in body
+    assert "I retrieved 4 documents and attached one in a ZIP file" in body
     assert (
-        "3 documents could not be included, including 1 that exceeded the email attachment limit"
-        in (body)
+        "Three documents could not be included, including one that exceeded "
+        "the email attachment limit" in body
     )
     assert all(path.name not in body for path in files)
     assert {(error.document, error.error) for error in parts[0].errors} == {
@@ -883,7 +884,7 @@ def test_all_ten_files_can_be_delivered_with_partial_download_errors(
         if "body" in call.kwargs
     ]
     first_body = decode_reply(base64.urlsafe_b64decode(payloads[0]["raw"])).get_body().get_content()
-    assert "I retrieved 10 of 13 Exhibits" in first_body
+    assert "I retrieved 10 of the 13 Exhibits" in first_body
     assert "I couldn't retrieve 2 requested documents" in first_body
     assert "10 separate replies" in first_body
     assert "failed-1.pdf" not in first_body
@@ -909,7 +910,7 @@ def test_multiple_documents_are_grouped_when_the_encoded_message_fits(
     assert len(combined) == 1
     assert combined[0].filenames == ("file-0.pdf", "file-1.pdf")
     body = decode_reply(combined[0].raw).get_body().get_content()
-    assert "I've attached all 2 retrieved documents" in body
+    assert "and attached two" in body
     assert "separate replies" not in body
     assert "attachment limit" not in body
     assert "Part " not in body
@@ -943,6 +944,7 @@ def prepare_multi_zip_delivery(client, tmp_path, monkeypatch, *, count=2, messag
         tmp_path / "archives",
         matter_id="M12205",
         document_type=DocumentType.EXHIBITS,
+        available_count=13,
     )
     return prepared, sources
 
@@ -968,8 +970,8 @@ def test_multiple_verified_zips_share_one_email_and_one_receipt(
             contents.update({name: archive.read(name) for name in archive.namelist()})
     assert contents == {source.name: source.read_bytes() for source in sources}
     body = reply.get_body().get_content()
-    assert "I retrieved 2 of 13 Exhibits" in body
-    assert "I've attached all 2 retrieved documents" in body
+    assert "I retrieved 2 of the 13 Exhibits" in body
+    assert "and attached two" in body
     for unwanted in ("separate replies", "attachment limit", "MIME", "receipts", "Part "):
         assert unwanted not in body
     service.users().messages().send.reset_mock()
@@ -1078,13 +1080,14 @@ def test_all_four_documents_too_large_produces_one_plain_language_reply(
         tmp_path / "batches",
         matter_id="M12205",
         document_type=DocumentType.EXHIBITS,
+        available_count=13,
     )
     assert len(parts) == 1
     reply = decode_reply(parts[0].raw)
     assert not list(reply.iter_attachments())
     body = reply.get_body().get_content()
-    assert "None of the retrieved documents could be included" in body
-    assert "4 documents exceeded the email attachment limit and couldn't be included" in body
+    assert "but none could be attached" in body
+    assert "Four documents exceeded the email attachment limit" in body
     assert "separate replies" not in body
     assert "I've attached" not in body
     assert all(source.name not in body for source in files)
@@ -1153,6 +1156,7 @@ def test_largest_first_zip_grouping_avoids_an_unnecessary_third_email(
         tmp_path / "zips",
         matter_id="M12205",
         document_type=DocumentType.EXHIBITS,
+        available_count=13,
     )
     assert len(parts) == 2
     assert [len(list(decode_reply(part.raw).iter_attachments())) for part in parts] == [2, 2]
@@ -1178,6 +1182,7 @@ def test_summary_can_precede_a_large_attachment_without_discarding_the_document(
         tmp_path / "zips",
         matter_id="M12205",
         document_type=DocumentType.EXHIBITS,
+        available_count=13,
     )
     assert len(parts) == 2
     first, last = [decode_reply(part.raw) for part in parts]
@@ -1188,3 +1193,70 @@ def test_summary_can_precede_a_large_attachment_without_discarding_the_document(
     assert "final set of Exhibits for matter M12205" in last.get_body().get_content()
     assert not parts[0].errors
     assert parts[1].filenames == ("large.pdf",)
+
+
+@pytest.mark.parametrize(
+    "retrieved, available, oversized, zip_limit, expected",
+    [
+        (
+            10,
+            13,
+            4,
+            500,
+            "I retrieved 10 of the 13 Exhibits and attached six across three ZIP files. "
+            "The remaining four exceeded the email attachment limit.",
+        ),
+        (1, 1, 0, 10000, "I retrieved 1 of the 1 Exhibit and attached one in a ZIP file."),
+        (2, 13, 0, 10000, "I retrieved 2 of the 13 Exhibits and attached two in a ZIP file."),
+        (
+            2,
+            13,
+            1,
+            10000,
+            "I retrieved 2 of the 13 Exhibits and attached one in a ZIP file. "
+            "The remaining one exceeded the email attachment limit.",
+        ),
+    ],
+)
+def test_compact_delivery_counts_use_actual_documents_and_zip_attachments(
+    client, tmp_path, monkeypatch, retrieved, available, oversized, zip_limit, expected
+):
+    import random
+
+    from src.agent import format_summary
+    from src.models import ProcessingResult
+
+    monkeypatch.setattr("src.email_client.MAX_ATTACHMENT_BYTES", zip_limit)
+    monkeypatch.setattr("src.email_client.MAX_MESSAGE_BYTES", 7500)
+    rng = random.Random(88)
+    files = []
+    for index in range(retrieved):
+        source = tmp_path / f"{index}.pdf"
+        size = 100 if index < retrieved - oversized else 10000
+        source.write_bytes(b"%PDF-" + rng.randbytes(size))
+        files.append(source)
+    result = ProcessingResult(
+        retrieved, available, MatterMetadata("M12205", counts={DocumentType.EXHIBITS: available})
+    )
+    parts = client.prepare_delivery(
+        incoming(),
+        format_summary(result, DocumentType.EXHIBITS, delivery_pending=True),
+        tuple(files),
+        Packager(),
+        tmp_path / "zips",
+        matter_id="M12205",
+        document_type=DocumentType.EXHIBITS,
+        available_count=available,
+    )
+    assert len(parts) == 1
+    message = decode_reply(parts[0].raw)
+    body = message.get_body().get_content().replace("\r\n", "\n")
+    assert expected in body
+    assert body.count("I retrieved") == 1
+    assert body.count("attached") == 1
+    if not oversized:
+        assert "attachment limit" not in body
+    assert len(parts[0].filenames) == retrieved - oversized
+    assert len(parts[0].errors) == oversized
+    if retrieved == 10:
+        assert len(list(message.iter_attachments())) == 3

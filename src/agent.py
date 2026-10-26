@@ -289,6 +289,7 @@ class Agent:
                     matter_id=request.matter_id,
                     document_type=request.document_type,
                     errors=result.errors,
+                    available_count=result.available_count,
                 )
                 if downloads and downloads.files
                 else None
