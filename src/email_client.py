@@ -366,11 +366,13 @@ class EmailClient:
         config: Config | None = None,
         *,
         service=None,
-        state_path: Path = Path("output/gmail_state.sqlite3"),
+        state_path: Path | None = None,
     ) -> None:
         self.config = config or Config.from_env()
         self._service = service
-        self.state_path = state_path.resolve()
+        self.state_path = (
+            state_path if state_path is not None else self.config.gmail_state_path
+        ).resolve()
         self._store: MessageStore | None = None
 
     @property
@@ -409,6 +411,12 @@ class EmailClient:
                             "Cannot refresh Gmail credentials: network unavailable"
                         ) from None
             if not credentials or not credentials.valid:
+                if not self.config.gmail_allow_interactive_auth:
+                    raise AuthenticationRequired(
+                        "Gmail authorization required. Authorize locally with --gmail-auth, "
+                        "then securely provision the Gmail token at GMAIL_TOKEN_PATH. "
+                        "Interactive authorization is disabled."
+                    )
                 if not interactive:
                     raise AuthenticationRequired("Run uv run python -m src.main --gmail-auth")
                 flow = InstalledAppFlow.from_client_secrets_file(

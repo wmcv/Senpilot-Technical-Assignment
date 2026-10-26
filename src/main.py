@@ -1,8 +1,10 @@
 """Offline request parsing and independent UARB retrieval CLI."""
 
 import argparse
+import os
+import signal
 import sys
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -13,6 +15,22 @@ from src.models import DocumentType, ProcessingResult
 from src.packager import Packager
 from src.parser import OpenRouterFallback, configure_interpretation_logging, interpret_request
 from src.uarb import UARBClient
+
+
+@contextmanager
+def _graceful_termination():
+    """Unwind normal cleanup on SIGTERM, including during redeployment."""
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def stop(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def _retrieve(args: argparse.Namespace) -> None:
@@ -114,7 +132,11 @@ def main() -> None:
     parser.add_argument("--matter", help="Matter ID, e.g. M12205")
     parser.add_argument("--type", choices=[category.value for category in DocumentType])
     parser.add_argument("--limit", type=int, default=10, choices=range(0, 11), metavar="0..10")
-    parser.add_argument("--output", type=Path, default=Path("downloads"))
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path(os.getenv("SENPILOT_OUTPUT_DIR", "downloads")),
+    )
     parser.add_argument("--headed", action="store_true", help="Show the browser")
     parser.add_argument(
         "--zip", action="store_true", help="Create a ZIP and print an email summary"
@@ -134,7 +156,8 @@ def main() -> None:
         if args.request or args.matter or args.type or args.zip:
             parser.error("Gmail commands cannot be combined with retrieval or parsing arguments")
         try:
-            _gmail(args)
+            with _graceful_termination():
+                _gmail(args)
         except KeyboardInterrupt:
             print("Gmail worker stopped.")
         except GmailError as error:

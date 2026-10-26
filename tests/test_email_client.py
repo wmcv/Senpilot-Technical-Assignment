@@ -495,3 +495,54 @@ def test_unexpected_retrieval_error_is_sanitized(client, service, tmp_path):
     assert "could not complete retrieval" in reply.get_body().get_content()
     assert "private" not in reply.get_body().get_content()
     assert not list(reply.iter_attachments())
+
+
+def test_email_client_uses_configured_state_path_and_explicit_override(config, service, tmp_path):
+    from dataclasses import replace
+
+    config = replace(config, gmail_state_path=tmp_path / "persistent.sqlite3")
+    assert EmailClient(config, service=service).state_path == config.gmail_state_path
+    override = tmp_path / "override.sqlite3"
+    assert EmailClient(config, service=service, state_path=override).state_path == override
+
+
+def test_container_cannot_start_interactive_oauth(config, tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    config = replace(config, gmail_allow_interactive_auth=False)
+    flow = Mock()
+    monkeypatch.setattr("src.email_client.InstalledAppFlow.from_client_secrets_file", flow)
+    email = EmailClient(config, state_path=tmp_path / "state.sqlite3")
+    with pytest.raises(AuthenticationRequired, match="Interactive authorization is disabled"):
+        email.authenticate(interactive=True)
+    flow.assert_not_called()
+    assert not config.gmail_token_path.exists()
+
+
+def test_noninteractive_container_can_reuse_valid_token(config, service, tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    config = replace(config, gmail_allow_interactive_auth=False)
+    config.gmail_token_path.write_text("{}")
+    credentials = Mock(valid=True, expired=False)
+    credentials.has_scopes.return_value = True
+    credentials.to_json.return_value = "{}"
+    monkeypatch.setattr(
+        "src.email_client.Credentials.from_authorized_user_file", Mock(return_value=credentials)
+    )
+    monkeypatch.setattr("src.email_client.build", Mock(return_value=service))
+    flow = Mock()
+    monkeypatch.setattr("src.email_client.InstalledAppFlow.from_client_secrets_file", flow)
+    email = EmailClient(config, state_path=tmp_path / "state.sqlite3")
+    assert email.authenticate() == "agent@example.com"
+    flow.assert_not_called()
+
+
+def test_interrupted_send_retains_duplicate_protection(client, config, service):
+    service.users().messages().send().execute.side_effect = KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        client.send_reply(incoming(), "Summary")
+    assert client.store.status("message-1") == "sending"
+    restarted = EmailClient(config, service=service, state_path=client.state_path)
+    with pytest.raises(AlreadyHandled):
+        restarted.send_reply(incoming(), "Summary")

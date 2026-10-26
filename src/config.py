@@ -16,10 +16,14 @@ class Config:
     google_oauth_path: Path = Path("credentials/google_oauth.json")
 
     gmail_token_path: Path = Path("credentials/gmail_token.json")
+    gmail_state_path: Path = Path("output/gmail_state.sqlite3")
+    gmail_allow_interactive_auth: bool = True
 
     @property
     def oauth_credentials_path(self) -> Path:
-        if self.google_oauth_path.is_file():
+        if self.google_oauth_path.is_file() or self.google_oauth_path != Path(
+            "credentials/google_oauth.json"
+        ):
             return self.google_oauth_path
         # Preserve the original downloaded Desktop OAuth file without renaming it.
         candidates = list(self.google_oauth_path.parent.glob("client_secret_*.json"))
@@ -35,6 +39,11 @@ class Config:
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
             openrouter_model=os.getenv("OPENROUTER_MODEL"),
             gmail_poll_interval=os.getenv("GMAIL_POLL_INTERVAL", "15"),
+            google_oauth_path=Path(os.getenv("GOOGLE_OAUTH_PATH", "credentials/google_oauth.json")),
+            gmail_token_path=Path(os.getenv("GMAIL_TOKEN_PATH", "credentials/gmail_token.json")),
+            gmail_state_path=Path(os.getenv("GMAIL_STATE_PATH", "output/gmail_state.sqlite3")),
+            gmail_allow_interactive_auth=os.getenv("GMAIL_ALLOW_INTERACTIVE_AUTH", "true").lower()
+            in {"1", "true", "yes"},
         )
 
     def validate_gmail(self) -> int:

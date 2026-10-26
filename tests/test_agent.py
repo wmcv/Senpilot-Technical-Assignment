@@ -235,3 +235,62 @@ def test_zip_cli_packages_successes_or_reports_no_zip(
         assert "No files are available" in output
         assert "ZIP: none" in output
     assert ("Failed document attempts (after retry): 1" in output) == failed
+
+
+def test_sigterm_unwinds_cleanup_and_restores_previous_handler(tmp_path):
+    import signal
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    from src.main import _graceful_termination
+
+    previous = signal.getsignal(signal.SIGTERM)
+    with pytest.raises(KeyboardInterrupt), _graceful_termination():
+        with TemporaryDirectory(dir=tmp_path) as workspace:
+            path = Path(workspace)
+            handler = signal.getsignal(signal.SIGTERM)
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+    assert not path.exists()
+    assert signal.getsignal(signal.SIGTERM) == previous
+
+
+def test_uv_forwards_sigterm_to_python_cleanup():
+    import selectors
+    import shutil
+    import subprocess
+
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv executable not available")
+    script = """
+import signal
+from src.main import _graceful_termination
+try:
+    with _graceful_termination():
+        try:
+            print('ready', flush=True)
+            signal.pause()
+        finally:
+            print('cleanup', flush=True)
+except KeyboardInterrupt:
+    pass
+"""
+    child = subprocess.Popen(
+        [uv, "run", "--no-sync", "python", "-u", "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        with selectors.DefaultSelector() as ready:
+            ready.register(child.stdout, selectors.EVENT_READ)
+            assert ready.select(timeout=10), "Signal-test child did not start"
+        assert child.stdout.readline().strip() == "ready"
+        child.terminate()
+        output, _ = child.communicate(timeout=10)
+        assert "cleanup" in output
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.communicate(timeout=5)

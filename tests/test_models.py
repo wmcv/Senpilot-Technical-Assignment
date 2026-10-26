@@ -67,3 +67,34 @@ def test_cancelled_request_contract():
         result.require_request()
     with pytest.raises(ValueError):
         ParseResult("M12345", DocumentType.EXHIBITS, cancelled=True)
+
+
+def test_configurable_gmail_paths_preserve_local_defaults(monkeypatch, tmp_path):
+    variables = (
+        "GOOGLE_OAUTH_PATH",
+        "GMAIL_TOKEN_PATH",
+        "GMAIL_STATE_PATH",
+        "GMAIL_ALLOW_INTERACTIVE_AUTH",
+    )
+    for name in variables:
+        monkeypatch.delenv(name, raising=False)
+    defaults = Config.from_env(tmp_path / "absent.env")
+    assert defaults.google_oauth_path == Path("credentials/google_oauth.json")
+    assert defaults.gmail_token_path == Path("credentials/gmail_token.json")
+    assert defaults.gmail_state_path == Path("output/gmail_state.sqlite3")
+    assert defaults.gmail_allow_interactive_auth
+    monkeypatch.setenv("GOOGLE_OAUTH_PATH", str(tmp_path / "google.json"))
+    monkeypatch.setenv("GMAIL_TOKEN_PATH", str(tmp_path / "token.json"))
+    monkeypatch.setenv("GMAIL_STATE_PATH", str(tmp_path / "state.sqlite3"))
+    monkeypatch.setenv("GMAIL_ALLOW_INTERACTIVE_AUTH", "false")
+    configured = Config.from_env(tmp_path / "absent.env")
+    assert configured.google_oauth_path == tmp_path / "google.json"
+    assert configured.gmail_token_path == tmp_path / "token.json"
+    assert configured.gmail_state_path == tmp_path / "state.sqlite3"
+    assert not configured.gmail_allow_interactive_auth
+
+
+def test_explicit_oauth_path_does_not_fall_back_to_another_file(tmp_path):
+    (tmp_path / "client_secret_other.json").write_text("{}")
+    config = Config(google_oauth_path=tmp_path / "missing.json")
+    assert config.oauth_credentials_path == tmp_path / "missing.json"
