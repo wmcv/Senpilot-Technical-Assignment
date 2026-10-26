@@ -94,3 +94,50 @@ def test_changed_source_is_detected(tmp_path, monkeypatch):
         Packager().package((source,), tmp_path / "result.zip")
     assert not (tmp_path / "result.zip").exists()
     assert not list(tmp_path.glob(".zip-*"))
+
+
+def test_batches_preserve_order_and_continue_after_invalid_or_oversized_files(tmp_path):
+    import random
+
+    rng = random.Random(71)
+    files = (
+        pdf(tmp_path, "first.pdf", b"%PDF-" + rng.randbytes(1000)),
+        pdf(tmp_path, "bad.pdf", b"<html>error page</html>"),
+        pdf(tmp_path, "huge.pdf", b"%PDF-" + rng.randbytes(5000)),
+        pdf(tmp_path, "last.pdf", b"%PDF-" + rng.randbytes(1000)),
+    )
+    batches, failures = Packager().batches(
+        files, tmp_path / "batches", lambda path: path.stat().st_size <= 1500
+    )
+    assert [batch.filenames for batch in batches] == [("first.pdf",), ("last.pdf",)]
+    assert [(error.document, error.error) for error in failures] == [
+        ("bad.pdf", "invalid PDF signature"),
+        ("huge.pdf", "exceeds safe encoded message limit"),
+    ]
+    for batch in batches:
+        with ZipFile(batch.archive) as archive:
+            assert archive.namelist() == list(batch.filenames)
+            assert archive.testzip() is None
+    assert not (tmp_path / "batches" / "documents-candidate.zip").exists()
+
+
+def test_batches_accept_exact_zip_boundary_and_never_emit_empty_archives(tmp_path):
+    source = pdf(tmp_path, "file.pdf")
+    reference = Packager().package((source,), tmp_path / "reference.zip")
+    size = reference.stat().st_size
+    batches, failures = Packager().batches(
+        (source,), tmp_path / "exact", lambda archive: archive.stat().st_size <= size
+    )
+    assert len(batches) == 1 and not failures
+    batches, failures = Packager().batches(
+        (source,), tmp_path / "small", lambda archive: archive.stat().st_size < size
+    )
+    assert not batches and len(failures) == 1
+    assert not list((tmp_path / "small").glob("*.zip"))
+    assert Packager().batches((), tmp_path / "empty", lambda _: True) == ((), ())
+
+
+def test_invalid_pdf_signature_prevents_packaging(tmp_path):
+    with pytest.raises(ValueError, match="PDF signature"):
+        Packager().package((pdf(tmp_path, "error.pdf", b"error"),), tmp_path / "out.zip")
+    assert not (tmp_path / "out.zip").exists()

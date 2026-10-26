@@ -467,12 +467,12 @@ def test_complete_mocked_workflow_preserves_zip_and_failures(
         )
     )
     body = reply.get_body().get_content()
-    assert "Successfully downloaded 1 of 5 Key Documents" in body
+    assert "I downloaded 1 of 5 Key Documents" in body
     assert "Failed document attempts (after retry): 1" in body
     attachments = list(reply.iter_attachments())
     if oversized:
         assert not attachments
-        assert "exceeds the safe email attachment size limit" in body
+        assert "exceeds safe encoded message limit" in body
         assert "attached as a ZIP" not in body
     else:
         assert attachments[0].get_payload(decode=True) == packager.verified
@@ -546,3 +546,332 @@ def test_interrupted_send_retains_duplicate_protection(client, config, service):
     restarted = EmailClient(config, service=service, state_path=client.state_path)
     with pytest.raises(AlreadyHandled):
         restarted.send_reply(incoming(), "Summary")
+
+
+def prepare_small_parts(client, tmp_path, monkeypatch, count=3):
+    """Incompressible seeded bytes force MIME-driven splitting with tiny limits."""
+    import random
+
+    from src.agent import format_summary
+    from src.models import ProcessingResult
+
+    monkeypatch.setattr("src.email_client.MAX_MESSAGE_BYTES", 7500)
+    monkeypatch.setattr("src.email_client.MAX_ATTACHMENT_BYTES", 10000)
+    rng = random.Random(7301)
+    files = []
+    for index in range(count):
+        path = tmp_path / f"file-{index}.pdf"
+        path.write_bytes(b"%PDF-1.7\n" + rng.randbytes(3000))
+        files.append(path)
+    result = ProcessingResult(
+        count, 13, MatterMetadata("M12205", counts={DocumentType.EXHIBITS: 13})
+    )
+    summary = format_summary(result, DocumentType.EXHIBITS, delivery_pending=True)
+    parts = client.prepare_delivery(incoming(), summary, tuple(files), Packager(), tmp_path / "zip")
+    assert len(parts) == count
+    return parts, files
+
+
+def decode_reply(raw):
+    return BytesParser(policy=policy.default).parsebytes(raw)
+
+
+def test_multipart_mime_size_threading_receipts_and_counts(client, service, tmp_path, monkeypatch):
+    import json
+    from io import BytesIO
+    from zipfile import ZipFile
+
+    parts, files = prepare_small_parts(client, tmp_path, monkeypatch)
+    assert all(len(part.raw) <= 7500 for part in parts)
+    messages = [decode_reply(part.raw) for part in parts]
+    assert len({message["Message-ID"] for message in messages}) == 3
+    for index, (message, source) in enumerate(zip(messages, files, strict=True), 1):
+        assert message["Subject"] == "Re: M12205 Exhibits"
+        assert message["In-Reply-To"] == incoming().rfc_message_id
+        assert message["References"] == "<ancestor@example.net> <original@example.net>"
+        body = message.get_body().get_content()
+        assert f"Part {index} of 3" in body
+        assert f"Previously accepted attachments: {index - 1} files" in body
+        assert "I downloaded 3 of 13 Exhibits" in body
+        assert "Files prepared for delivery: 3" in body
+        attachments = list(message.iter_attachments())
+        assert len(attachments) == 1
+        with ZipFile(BytesIO(attachments[0].get_payload(decode=True))) as archive:
+            assert archive.namelist() == [source.name]
+            assert archive.read(source.name) == source.read_bytes()
+    service.users().messages().send().execute.side_effect = [
+        {"id": f"receipt-{index}", "threadId": "thread-1"} for index in range(3)
+    ]
+    client.send_delivery(incoming(), parts)
+    assert client.store.status("message-1") == "processed"
+    rows = client.store.parts("message-1")
+    assert [row[3] for row in rows] == ["accepted"] * 3
+    assert [row[4] for row in rows] == [f"receipt-{index}" for index in range(3)]
+    assert [json.loads(row[2]) for row in rows] == [[source.name] for source in files]
+    assert all(row[1] is None for row in rows)  # Release accepted MIME blobs.
+    assert client.store.resumable() == []
+
+
+def test_exact_encoded_message_boundary(client, tmp_path, monkeypatch):
+    source = tmp_path / "test.pdf"
+    source.write_bytes(b"%PDF-test")
+    archive = Packager().package((source,), tmp_path / "test.zip")
+    body = "Summary with Unicode: é. " * 20
+    size = len(build_reply(incoming(), body, "agent@example.com", archive).as_bytes())
+    monkeypatch.setattr("src.email_client.MAX_MESSAGE_BYTES", size)
+    assert len(build_reply(incoming(), body, "agent@example.com", archive).as_bytes()) == size
+    monkeypatch.setattr("src.email_client.MAX_MESSAGE_BYTES", size - 1)
+    with pytest.raises(AttachmentTooLarge, match="Encoded message"):
+        build_reply(incoming(), body, "agent@example.com", archive)
+    assert client.store.status("message-1") is None
+
+
+def test_unfit_and_invalid_pdfs_reported_without_blocking_other_files(
+    client, tmp_path, monkeypatch
+):
+    import random
+
+    rng = random.Random(5)
+    monkeypatch.setattr("src.email_client.MAX_MESSAGE_BYTES", 7500)
+    files = []
+    for name, content in (
+        ("huge.pdf", b"%PDF-" + rng.randbytes(10000)),
+        ("error.pdf", b"not a PDF"),
+        ("empty.pdf", b""),
+        ("small.pdf", b"%PDF-" + rng.randbytes(500)),
+    ):
+        source = tmp_path / name
+        source.write_bytes(content)
+        files.append(source)
+    parts = client.prepare_delivery(
+        incoming(), "Downloaded 4 files.", tuple(files), Packager(), tmp_path / "batches"
+    )
+    assert len(parts) == 1
+    assert parts[0].filenames == ("small.pdf",)
+    message = decode_reply(parts[0].raw)
+    assert len(list(message.iter_attachments())) == 1
+    body = message.get_body().get_content()
+    assert "Undeliverable files: 3" in body
+    assert "Undeliverable [huge.pdf]: exceeds safe encoded message limit" in body
+    assert "Undeliverable [error.pdf]: invalid PDF signature" in body
+    assert "Undeliverable [empty.pdf]: download source is empty" in body
+    assert "Previously accepted attachments: 0 files" in body
+    assert "Files prepared for delivery: 1" in body
+
+
+@pytest.mark.parametrize(
+    "failure", ["timeout", "server", "receipt", "thread", "sqlite", "interrupt"]
+)
+def test_uncertain_part_holds_remaining_delivery_and_conversation(
+    client, config, service, tmp_path, monkeypatch, failure
+):
+    parts, _ = prepare_small_parts(client, tmp_path, monkeypatch)
+    client.store.stage_delivery(incoming(), parts)
+    api = service.users().messages()
+    if failure == "sqlite":
+        original_complete = client.store.complete_part
+
+        def complete(message_id, part, reply_id):
+            if part == 2:
+                raise sqlite3.OperationalError("private disk details")
+            original_complete(message_id, part, reply_id)
+
+        monkeypatch.setattr(client.store, "complete_part", complete)
+        second = {"id": "second"}
+    else:
+        second = {
+            "timeout": OSError("private transport details"),
+            "server": HttpError(httplib2.Response({"status": "500"}), b"private"),
+            "receipt": {},
+            "thread": {"id": "second", "threadId": "wrong-thread"},
+            "interrupt": KeyboardInterrupt(),
+        }[failure]
+    api.send().execute.side_effect = [{"id": "first"}, second, {"id": "must-not-send"}]
+    api.send.reset_mock()
+    expected = KeyboardInterrupt if failure == "interrupt" else DeliveryUncertain
+    with pytest.raises(expected):
+        client.resume_delivery(incoming())
+    assert api.send.call_count == 2
+    assert client.store.status("message-1") == "sending"
+    assert [row[3] for row in client.store.parts("message-1")] == ["accepted", "sending", "pending"]
+    restarted = EmailClient(config, service=service, state_path=client.state_path)
+    assert restarted.store.resumable() == []
+    with pytest.raises(AlreadyHandled):
+        restarted.resume_delivery(incoming())
+    with pytest.raises(DeliveryUncertain):
+        restarted.store.pending("thread-1", incoming().sender)
+    assert restarted.store.pending("thread-1", "another@example.net") is None
+    assert api.send.call_count == 2
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 413, 429])
+def test_definite_part_rejection_preserves_receipts_and_resumes_exact_bytes(
+    client, config, service, tmp_path, monkeypatch, status
+):
+    parts, files = prepare_small_parts(client, tmp_path, monkeypatch)
+    api = service.users().messages()
+    api.send().execute.side_effect = [
+        {"id": "first"},
+        HttpError(httplib2.Response({"status": str(status)}), b"private"),
+    ]
+    with pytest.raises(GmailError):
+        client.send_delivery(incoming(), parts)
+    rows = client.store.parts("message-1")
+    assert [row[3] for row in rows] == ["accepted", "pending", "pending"]
+    assert client.store.status("message-1") == "delivering"
+    with pytest.raises(GmailError, match="unresolved"):
+        client.store.complete("message-1", "bogus")
+    for source in files:
+        source.unlink()
+    for archive in (tmp_path / "zip").glob("*.zip"):
+        archive.unlink()
+    restarted = EmailClient(config, service=service, state_path=client.state_path)
+    saved = restarted.store.resumable()[0]
+    assert saved.body == ""
+    api.send().execute.side_effect = [{"id": "second"}, {"id": "third"}]
+    api.send.reset_mock()
+    restarted.resume_delivery(saved)
+    assert api.send.call_count == 2
+    sent = [call.kwargs["body"] for call in api.send.call_args_list]
+    assert [base64.urlsafe_b64decode(payload["raw"]) for payload in sent] == [
+        parts[1].raw,
+        parts[2].raw,
+    ]
+    assert all(payload["threadId"] == "thread-1" for payload in sent)
+    assert restarted.store.status("message-1") == "processed"
+    assert restarted.store.parts("message-1")[0][4] == "first"
+    assert restarted.store.pending("thread-1", incoming().sender) is None
+
+
+@pytest.mark.parametrize("after_last", [False, True])
+def test_crash_between_parts_or_before_final_commit_resumes_without_resend(
+    client, config, service, tmp_path, monkeypatch, after_last
+):
+    parts, _ = prepare_small_parts(client, tmp_path, monkeypatch)
+    client.store.stage_delivery(incoming(), parts)
+    accepted = 3 if after_last else 1
+    for index in range(1, accepted + 1):
+        client.store.claim_part("message-1", index)
+        client.store.complete_part("message-1", index, f"receipt-{index}")
+    restarted = EmailClient(config, service=service, state_path=client.state_path)
+    api = service.users().messages()
+    api.send.reset_mock()
+    agent = Agent(Mock(), Packager(), restarted, store=restarted.store)
+    work = tmp_path / "workspace"
+    assert run_polling(agent, work, once=True) == 1
+    assert api.send.call_count == 3 - accepted
+    agent.uarb.get_matter.assert_not_called()
+    assert list(work.iterdir()) == []
+    assert restarted.store.status("message-1") == "processed"
+    with pytest.raises(AlreadyHandled):
+        agent.process(incoming(), work)
+
+
+def test_delivery_finalization_failure_keeps_receipts_without_resending(
+    client, config, service, tmp_path, monkeypatch
+):
+    parts, _ = prepare_small_parts(client, tmp_path, monkeypatch)
+    with client.store.connect() as db:
+        db.execute(
+            "CREATE TRIGGER fail_finish BEFORE DELETE ON conversation_updates "
+            "BEGIN SELECT RAISE(ABORT, 'test disk failure'); END"
+        )
+    with pytest.raises(GmailError, match="receipts saved"):
+        client.send_delivery(incoming(), parts)
+    assert client.store.status("message-1") == "delivering"
+    assert all(row[3] == "accepted" for row in client.store.parts("message-1"))
+    with client.store.connect() as db:
+        db.execute("DROP TRIGGER fail_finish")
+    restarted = EmailClient(config, service=service, state_path=client.state_path)
+    api = service.users().messages()
+    api.send.reset_mock()
+    restarted.resume_delivery(incoming())
+    api.send.assert_not_called()
+    assert restarted.store.status("message-1") == "processed"
+
+
+def test_resume_rejects_other_sender_or_thread(client, tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    parts, _ = prepare_small_parts(client, tmp_path, monkeypatch)
+    client.store.stage_delivery(incoming(), parts)
+    for original in (
+        replace(incoming(), sender="other@example.net"),
+        replace(incoming(), thread_id="other-thread"),
+    ):
+        with pytest.raises(GmailError, match="routing"):
+            client.resume_delivery(original)
+    assert all(row[3] == "pending" for row in client.store.parts("message-1"))
+
+
+def test_all_ten_files_can_be_delivered_with_partial_download_errors(
+    client, service, tmp_path, monkeypatch
+):
+    import random
+    from dataclasses import replace
+
+    from src.models import DocumentError, DownloadResult
+
+    monkeypatch.setattr("src.email_client.MAX_MESSAGE_BYTES", 7500)
+
+    class Matter:
+        def get_matter(self, matter_id):
+            return MatterMetadata(matter_id, counts={DocumentType.EXHIBITS: 13})
+
+        def download_documents(self, matter_id, document_type, destination, *, limit=10):
+            assert limit == 10
+            rng = random.Random(29)
+            files = []
+            for index in range(limit):
+                source = destination / f"doc-{index}.pdf"
+                source.write_bytes(b"%PDF-" + rng.randbytes(3000))
+                files.append(source)
+            return DownloadResult(
+                tuple(files),
+                (
+                    DocumentError("failed-1.pdf", "unavailable"),
+                    DocumentError("failed-2.pdf", "unavailable"),
+                ),
+            )
+
+    agent = Agent(Matter(), Packager(), client, store=client.store)
+    result = agent.process(replace(incoming(), body="M12205 Exhibits"), tmp_path / "work")
+    assert result.downloaded_count == 10
+    assert len(result.errors) == 2
+    rows = client.store.parts("message-1")
+    import json
+
+    delivered = [name for row in rows for name in json.loads(row[2])]
+    assert delivered == [f"doc-{index}.pdf" for index in range(10)]
+    assert all(row[3] == "accepted" for row in rows)
+    message = decode_reply(
+        base64.urlsafe_b64decode(service.users().messages().send.call_args.kwargs["body"]["raw"])
+    )
+    body = message.get_body().get_content()
+    assert "I downloaded 10 of 13 Exhibits" in body
+    assert "Failed document attempts (after retry): 2" in body
+    assert "Previously accepted attachments: 9 files" in body
+    assert "This reply contains a ZIP with 1 file" in body
+    assert "Files prepared for delivery: 10" in body
+    assert client.store.status("message-1") == "processed"
+    assert not list((tmp_path / "work").iterdir())
+
+
+def test_multiple_documents_are_grouped_when_the_encoded_message_fits(
+    client, tmp_path, monkeypatch
+):
+    parts, _ = prepare_small_parts(client, tmp_path, monkeypatch, count=2)
+    assert len(parts) == 2
+    monkeypatch.setattr("src.email_client.MAX_MESSAGE_BYTES", 15000)
+    combined = client.prepare_delivery(
+        incoming(),
+        "Downloaded two files.",
+        tuple(tmp_path / f"file-{index}.pdf" for index in range(2)),
+        Packager(),
+        tmp_path / "combined",
+    )
+    assert len(combined) == 1
+    assert combined[0].filenames == ("file-0.pdf", "file-1.pdf")
+    body = decode_reply(combined[0].raw).get_body().get_content()
+    assert "Part 1 of 1" in body
+    assert "ZIP with 2 files" in body

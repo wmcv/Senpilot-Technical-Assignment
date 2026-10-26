@@ -103,7 +103,7 @@ def test_multiple_turns_survive_worker_restart_and_clear_on_success(setup, tmp_p
     assert restarted_email.store.pending("thread-1", first.sender)[1] == 2
     restarted.process(incoming("three", "Key Documents."), tmp_path / "third")
     assert matter.visited == ["M12345"]
-    assert "Requested category: Key Documents" in replies[-1].get_content()
+    assert "I downloaded 0 of 0 Key Documents" in replies[-1].get_content()
     assert email.store.pending("thread-1", first.sender) is None
     assert email.store.status("three") == "processed"
 
@@ -127,7 +127,7 @@ def test_explicit_category_correction_ignores_history_and_stale_subject(setup, t
         incoming("three", "M12345", subject="Re: Transcripts, please"), tmp_path / "three"
     )
     assert matter.visited == ["M12345"]
-    assert "Requested category: Exhibits" in replies[-1].get_content()
+    assert "I downloaded 0 of 0 Exhibits" in replies[-1].get_content()
 
 
 def test_explicit_matter_correction(setup, tmp_path):
@@ -137,7 +137,7 @@ def test_explicit_matter_correction(setup, tmp_path):
     assert email.store.pending("thread-1", "alice@example.net")[0].matter_id == "M54321"
     agent.process(incoming("three", "Recordings please"), tmp_path / "three")
     assert matter.visited == ["M54321"]
-    assert "Requested category: Recordings" in replies[-1].get_content()
+    assert "I downloaded 0 of 0 Recordings" in replies[-1].get_content()
 
 
 def test_unmarked_conflicting_correction_still_requires_clarification(setup, tmp_path):
@@ -392,7 +392,7 @@ def test_model_recovery_completes_pending_conversation(setup, tmp_path):
         tmp_path / "two",
     )
     assert matter.visited == ["M12345"]
-    assert "Requested category: Transcripts" in replies[-1].get_content()
+    assert "I downloaded 0 of 0 Transcripts" in replies[-1].get_content()
     assert "M54321" not in fallback.parse.call_args.args[0]
     assert fallback.parse.call_args.args[1].matter_id == "M12345"
     assert email.store.pending("thread-1", "alice@example.net") is None

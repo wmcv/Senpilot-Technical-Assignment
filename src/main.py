@@ -86,7 +86,7 @@ def _retrieve(args: argparse.Namespace) -> None:
                     format_summary(
                         processing,
                         DocumentType(args.type),
-                        archive_attached=archive is not None,
+                        archive_attached=False,
                     )
                 )
                 print(f"ZIP: {archive}" if archive else "ZIP: none")

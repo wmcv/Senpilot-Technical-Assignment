@@ -11,6 +11,7 @@ import os
 import sqlite3
 import time
 from contextlib import contextmanager
+from dataclasses import asdict, dataclass
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
@@ -29,7 +30,8 @@ from googleapiclient.errors import HttpError
 from httplib2 import Http
 
 from src.config import Config
-from src.models import DocumentType, IncomingEmail, ParseResult
+from src.models import DocumentError, DocumentType, IncomingEmail, ParseResult
+from src.packager import Packager
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
@@ -59,10 +61,17 @@ class AlreadyHandled(GmailError):
     pass
 
 
-class MessageStore:
-    """Persist IDs and validated partial requests, never raw email bodies.
+@dataclass(frozen=True)
+class PreparedReply:
+    raw: bytes
+    filenames: tuple[str, ...] = ()
 
-    'sending' requires manual review; pending state changes with the send receipt.
+
+class MessageStore:
+    """Persist IDs, validated requests, and unfinished outgoing MIME parts.
+
+    Incoming bodies are never stored. 'sending' requires manual review;
+    conversation state changes only after all send receipts are saved.
     """
 
     def __init__(self, path: Path, mailbox: str) -> None:
@@ -98,6 +107,15 @@ class MessageStore:
                 "message_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, sender TEXT NOT NULL, "
                 "request_json TEXT, turns INTEGER NOT NULL, status TEXT NOT NULL)"
             )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS deliveries ("
+                "message_id TEXT PRIMARY KEY, original_json TEXT NOT NULL)"
+            )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS delivery_parts ("
+                "message_id TEXT, part INTEGER, raw BLOB, filenames TEXT NOT NULL, "
+                "status TEXT NOT NULL, reply_id TEXT, PRIMARY KEY(message_id, part))"
+            )
             self.cutoff_ms = int(
                 db.execute("SELECT value FROM settings WHERE key='cutoff_ms'").fetchone()[0]
             )
@@ -124,8 +142,104 @@ class MessageStore:
         except sqlite3.IntegrityError:
             raise AlreadyHandled("Message already handled or awaiting delivery review") from None
 
+    def stage_delivery(self, original: IncomingEmail, parts: tuple[PreparedReply, ...]) -> None:
+        if not parts:
+            raise ValueError("delivery requires at least one reply")
+        # Only reply-routing headers are retained, never the incoming body.
+        routing = asdict(original) | {"body": ""}
+        try:
+            with self.connect() as db:
+                db.execute(
+                    "INSERT INTO messages (id, status) VALUES (?, 'delivering')",
+                    (original.message_id,),
+                )
+                db.execute(
+                    "INSERT INTO deliveries VALUES (?, ?)",
+                    (original.message_id, json.dumps(routing)),
+                )
+                db.execute(
+                    "INSERT OR REPLACE INTO conversation_updates VALUES (?, ?, ?, NULL, 0, ?)",
+                    (
+                        original.message_id,
+                        original.thread_id,
+                        _address(original.sender).casefold(),
+                        "delivering",
+                    ),
+                )
+                db.executemany(
+                    "INSERT INTO delivery_parts VALUES (?, ?, ?, ?, 'pending', NULL)",
+                    [
+                        (original.message_id, index, part.raw, json.dumps(part.filenames))
+                        for index, part in enumerate(parts, 1)
+                    ],
+                )
+        except sqlite3.IntegrityError:
+            raise AlreadyHandled("Delivery already staged") from None
+
+    def resumable(self) -> list[IncomingEmail]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT d.original_json FROM deliveries d JOIN messages m ON m.id=d.message_id "
+                "WHERE m.status='delivering' ORDER BY d.rowid"
+            ).fetchall()
+        return [IncomingEmail(**json.loads(row[0])) for row in rows]
+
+    def parts(self, message_id: str, *, include_payload: bool = True) -> list[tuple]:
+        payload = "raw" if include_payload else "NULL"
+        with self.connect() as db:
+            return db.execute(
+                f"SELECT part, {payload}, filenames, status, reply_id FROM delivery_parts "
+                "WHERE message_id=? ORDER BY part",
+                (message_id,),
+            ).fetchall()
+
+    def part_payload(self, message_id: str, part: int) -> bytes | None:
+        with self.connect() as db:
+            return db.execute(
+                "SELECT raw FROM delivery_parts WHERE message_id=? AND part=?", (message_id, part)
+            ).fetchone()[0]
+
+    def claim_part(self, message_id: str, part: int) -> None:
+        with self.connect() as db:
+            claimed = db.execute(
+                "UPDATE messages SET status='sending' WHERE id=? AND status='delivering'",
+                (message_id,),
+            ).rowcount
+            changed = db.execute(
+                "UPDATE delivery_parts SET status='sending' "
+                "WHERE message_id=? AND part=? AND status='pending'",
+                (message_id, part),
+            ).rowcount
+            if not claimed or not changed:
+                raise AlreadyHandled("Delivery part already handled or awaiting review")
+
+    def release_part(self, message_id: str, part: int) -> None:
+        with self.connect() as db:
+            db.execute(
+                "UPDATE delivery_parts SET status='pending' "
+                "WHERE message_id=? AND part=? AND status='sending'",
+                (message_id, part),
+            )
+            db.execute("UPDATE messages SET status='delivering' WHERE id=?", (message_id,))
+
+    def complete_part(self, message_id: str, part: int, reply_id: str) -> None:
+        with self.connect() as db:
+            changed = db.execute(
+                "UPDATE delivery_parts SET status='accepted', reply_id=?, raw=NULL "
+                "WHERE message_id=? AND part=? AND status='sending'",
+                (reply_id, message_id, part),
+            ).rowcount
+            if not changed:
+                raise GmailError("Delivery part was not claimed")
+            db.execute("UPDATE messages SET status='delivering' WHERE id=?", (message_id,))
+
     def complete(self, message_id: str, reply_id: str) -> None:
         with self.connect() as db:
+            if db.execute(
+                "SELECT 1 FROM delivery_parts WHERE message_id=? AND status!='accepted'",
+                (message_id,),
+            ).fetchone():
+                raise GmailError("Delivery still has unresolved parts")
             db.execute(
                 "UPDATE messages SET status='processed', reply_id=? WHERE id=?",
                 (reply_id, message_id),
@@ -150,6 +264,7 @@ class MessageStore:
                         (thread, sender, request, turns, status),
                     )
                 db.execute("DELETE FROM conversation_updates WHERE message_id=?", (message_id,))
+            db.execute("DELETE FROM deliveries WHERE message_id=?", (message_id,))
 
     def release(self, message_id: str) -> None:
         with self.connect() as db:
@@ -161,7 +276,7 @@ class MessageStore:
         with self.connect() as db:
             if db.execute(
                 "SELECT 1 FROM conversation_updates u JOIN messages m ON m.id=u.message_id "
-                "WHERE u.thread_id=? AND u.sender=? AND m.status='sending'",
+                "WHERE u.thread_id=? AND u.sender=? AND m.status IN ('sending', 'delivering')",
                 (thread_id, sender),
             ).fetchone():
                 raise DeliveryUncertain(
@@ -326,6 +441,8 @@ def build_reply(
     body: str,
     mailbox: str,
     attachment: Path | None = None,
+    *,
+    part: tuple[int, int] | None = None,
 ) -> EmailMessage:
     """Create the exact MIME bytes sent; never alter or recompress the verified ZIP."""
     message = EmailMessage(policy=policy.SMTP)
@@ -336,11 +453,13 @@ def build_reply(
         if original.subject.lower().startswith("re:")
         else (f"Re: {original.subject}")
     )
+    # Part labels belong in the body: changing the subject can split Gmail threads.
     if not original.rfc_message_id:
         raise GmailError("Incoming message lacks Message-ID; cannot safely thread a reply")
     message["In-Reply-To"] = original.rfc_message_id
     message["References"] = " ".join(filter(None, (original.references, original.rfc_message_id)))
-    digest = hashlib.sha256(f"{mailbox}:{original.message_id}".encode()).hexdigest()
+    identity = f"{mailbox}:{original.message_id}" + (f":part:{part[0]}" if part else "")
+    digest = hashlib.sha256(identity.encode()).hexdigest()
     message["Message-ID"] = f"<senpilot-{digest}@{mailbox.split('@')[-1]}>"
     message["Auto-Submitted"] = "auto-replied"
     message.set_content(body)
@@ -498,6 +617,149 @@ class EmailClient:
             if not page_token:
                 break
         return [message for _, message in sorted(received, key=lambda item: item[0])]
+
+    def prepare_delivery(
+        self,
+        original: IncomingEmail,
+        summary: str,
+        files: tuple[Path, ...],
+        packager: Packager,
+        directory: Path,
+    ) -> tuple[PreparedReply, ...]:
+        """Fit verified ZIPs into complete MIME messages, including all headers/body.
+
+        Probe with an upper-bound report for ten files/parts and every possible
+        undeliverable filename. Final messages are checked again before staging.
+        """
+        if len(files) > 10:
+            raise ValueError("at most ten downloaded files may be delivered")
+        mailbox = self.config.agent_email
+        names = tuple(path.name for path in files)
+
+        def body(index, total, members, before_files, before_parts, deliverable, failures):
+            unit = "file" if len(members) == 1 else "files"
+            details = (
+                f"Part {index} of {total}. This reply contains a ZIP with {len(members)} {unit}: "
+                + ", ".join(members)
+                + f".\nPreviously accepted attachments: {before_files} files in {before_parts} "
+                f"parts. Files prepared for delivery: {deliverable}."
+            )
+            if failures:
+                details += f"\nUndeliverable files: {len(failures)}.\n" + "\n".join(
+                    f"Undeliverable [{error.document}]: {error.error}." for error in failures
+                )
+            return summary.removesuffix("\n\nBest,\nSenpilot Document Agent") + (
+                f"\n\n{details}\n\nBest,\nSenpilot Document Agent"
+            )
+
+        possible_failures = tuple(
+            DocumentError(name, "exceeds safe encoded message limit") for name in names
+        )
+
+        def fits(archive):
+            try:
+                build_reply(
+                    original,
+                    body(10, 10, names, 10, 10, 10, possible_failures),
+                    mailbox,
+                    archive,
+                    part=(10, 10),
+                )
+            except AttachmentTooLarge:
+                return False
+            return True
+
+        batches, failures = packager.batches(files, directory, fits)
+        if not batches:
+            report = summary.removesuffix("\n\nBest,\nSenpilot Document Agent")
+            report += "\n\nNo ZIP is attached. Accepted attachments: 0 files."
+            if failures:
+                report += f"\nUndeliverable files: {len(failures)}.\n" + "\n".join(
+                    f"Undeliverable [{error.document}]: {error.error}." for error in failures
+                )
+            report += "\n\nBest,\nSenpilot Document Agent"
+            return (PreparedReply(build_reply(original, report, mailbox).as_bytes()),)
+        prepared = []
+        accepted = 0
+        deliverable = sum(len(batch.filenames) for batch in batches)
+        for index, batch in enumerate(batches, 1):
+            message = build_reply(
+                original,
+                body(
+                    index, len(batches), batch.filenames, accepted, index - 1, deliverable, failures
+                ),
+                mailbox,
+                batch.archive,
+                part=(index, len(batches)),
+            )
+            prepared.append(PreparedReply(message.as_bytes(), batch.filenames))
+            accepted += len(batch.filenames)
+        return tuple(prepared)
+
+    def send_delivery(self, original: IncomingEmail, parts: tuple[PreparedReply, ...]) -> None:
+        self.store.stage_delivery(original, parts)
+        self.resume_delivery(original)
+
+    def resume_delivery(self, original: IncomingEmail) -> None:
+        """Use persisted bytes only; never redownload or regenerate accepted parts."""
+        if self.store.status(original.message_id) != "delivering":
+            raise AlreadyHandled("Delivery already handled or awaiting review")
+        saved = next(
+            (item for item in self.store.resumable() if item.message_id == original.message_id),
+            None,
+        )
+        if saved is None or (
+            saved.thread_id != original.thread_id
+            or _address(saved.sender).casefold() != _address(original.sender).casefold()
+        ):
+            raise GmailError("Delivery routing does not match the saved request")
+        api = self._api()
+        rows = self.store.parts(original.message_id, include_payload=False)
+        for part, _, _, status, _ in rows:
+            if status == "accepted":
+                continue
+            raw = self.store.part_payload(original.message_id, part)
+            if status != "pending" or raw is None:
+                raise DeliveryUncertain("Delivery part requires review; sending held")
+            self.store.claim_part(original.message_id, part)
+            try:
+                response = api.send(
+                    userId="me",
+                    body={
+                        "threadId": saved.thread_id,
+                        "raw": base64.urlsafe_b64encode(raw).decode("ascii"),
+                    },
+                ).execute(num_retries=0)
+            except HttpError as error:
+                if error.resp.status in {400, 401, 403, 404, 413, 429}:
+                    self.store.release_part(original.message_id, part)
+                    if error.resp.status == 401:
+                        raise AuthenticationRequired("Gmail authorization required") from None
+                    raise GmailError(
+                        f"Gmail rejected ZIP part (HTTP {error.resp.status})"
+                    ) from None
+                raise DeliveryUncertain("ZIP part delivery uncertain; sending held") from None
+            except Exception:
+                raise DeliveryUncertain("ZIP part delivery uncertain; sending held") from None
+            try:
+                if not response.get("id") or response.get("threadId", saved.thread_id) != (
+                    saved.thread_id
+                ):
+                    raise ValueError("invalid send receipt")
+                self.store.complete_part(original.message_id, part, response["id"])
+            except Exception:
+                raise DeliveryUncertain(
+                    "ZIP part receipt could not be saved; sending held"
+                ) from None
+        # If this final transaction fails, every accepted part stays recorded and
+        # the next run retries only completion, without sending another message.
+        try:
+            receipts = self.store.parts(original.message_id, include_payload=False)
+            self.store.complete(original.message_id, receipts[-1][4])
+        except sqlite3.Error:
+            raise GmailError(
+                "Delivery receipts saved; completion pending. Accepted parts will not be resent."
+            ) from None
 
     def send_reply(
         self,

@@ -1,8 +1,13 @@
 """Contract-level orchestration checks with explicit test doubles."""
 
+from email import policy
+from email.parser import BytesParser
+from io import BytesIO
+
 import pytest
 
 from src.agent import Agent
+from src.config import Config
 from src.email_client import EmailClient
 from src.models import DocumentError, DocumentType, DownloadResult, IncomingEmail, MatterMetadata
 from src.packager import Packager
@@ -12,9 +17,17 @@ from src.uarb import UARBClient
 class CapturingEmail(EmailClient):
     def __init__(self):
         self.replies = []
+        self.config = Config(agent_email="agent@example.com")
 
     def send_reply(self, original, body, attachment=None):
         self.replies.append((original.thread_id, body, attachment))
+
+    def send_delivery(self, original, parts):
+        for part in parts:
+            reply = BytesParser(policy=policy.default).parsebytes(part.raw)
+            attachments = list(reply.iter_attachments())
+            archive = BytesIO(attachments[0].get_payload(decode=True)) if attachments else None
+            self.replies.append((original.thread_id, reply.get_body().get_content(), archive))
 
 
 class FixtureUARB(UARBClient):
@@ -27,7 +40,9 @@ class FixtureUARB(UARBClient):
 
     def download_documents(self, matter_id, document_type, destination, *, limit=10):
         self.limit = limit
-        return DownloadResult((destination / "a.pdf",), (DocumentError("b.pdf", "failed"),))
+        path = destination / "a.pdf"
+        path.write_bytes(b"%PDF-fixture")
+        return DownloadResult((path,), (DocumentError("b.pdf", "failed"),))
 
 
 class CapturingPackager(Packager):
@@ -36,11 +51,11 @@ class CapturingPackager(Packager):
 
     def package(self, files, destination):
         self.files = files
-        return destination
+        return super().package(files, destination)
 
 
 def message(body):
-    return IncomingEmail("id", "thread", "sender@example.com", "", body)
+    return IncomingEmail("id", "thread", "sender@example.com", "", body, "<id@example.com>")
 
 
 def test_clarification_does_not_retrieve(tmp_path):
@@ -63,7 +78,10 @@ def test_partial_download_reports_errors_and_caps_limit(tmp_path):
     assert packager.files[0].parent.parent == tmp_path
     assert not packager.files[0].parent.exists()
     assert "Error [b.pdf]: failed" in email.replies[0][1]
-    assert email.replies[0][2] == tmp_path / "M12205.zip"
+    from zipfile import ZipFile
+
+    with ZipFile(email.replies[0][2]) as archive:
+        assert archive.namelist() == ["a.pdf"]
 
 
 def test_zero_documents_does_not_package(tmp_path):
@@ -102,20 +120,18 @@ def test_summary_is_deterministic_and_uses_metadata():
         ),
     )
     body = format_summary(result, DocumentType.OTHER_DOCUMENTS, archive_attached=True)
-    assert body.startswith("Hi,\n\nMatter: M12205\nTitle: A real matter title")
+    assert body.startswith("Hi,\n\nMatter M12205 concerns A real matter title.")
     for value in (
-        "Category: Water",
-        "Matter type: Capital",
-        "Status: Closed",
+        "Capital in the Water category",
+        "Its status is Closed",
         "Directions given",
-        "Decision: 2025-10-23",
-        "Received: 2025-04-07",
-        "Transcripts: 0",
-        "Recordings: 0",
+        "decision was issued on October 23, 2025",
+        "received on April 7, 2025",
+        "no Transcripts",
+        "no Recordings",
     ):
         assert value in body
-    assert body.index("Decision:") < body.index("Received:")
-    assert "Successfully downloaded 10 of 43 Other Documents." in body
+    assert "I downloaded 10 of 43 Other Documents." in body
     assert "Failed document attempts (after retry): 2." in body
     assert "attached as a ZIP" in body
     assert body == format_summary(result, DocumentType.OTHER_DOCUMENTS, archive_attached=True)
@@ -127,7 +143,7 @@ def test_summary_is_deterministic_and_uses_metadata():
         (0, 0, (), "No files are available"),
         (6, 0, (DocumentError("a.pdf", "failed"),), "No files were downloaded"),
         (6, 0, (), "No files were downloaded"),
-        (6, 1, (DocumentError("a.pdf", "failed"),), "Successfully downloaded 1 of 6"),
+        (6, 1, (DocumentError("a.pdf", "failed"),), "I downloaded 1 of 6"),
     ],
 )
 def test_summary_zero_and_partial(available, downloaded, errors, expected):
@@ -140,8 +156,8 @@ def test_summary_zero_and_partial(available, downloaded, errors, expected):
     )
     assert expected in body
     assert "No ZIP is attached" in body
-    assert "Title: Unknown" in body
-    assert "Exhibits: Unknown" in body
+    assert "is listed in the UARB database" in body
+    assert "an unknown number of Exhibits" in body
     assert ("Failed document attempts" in body) == bool(errors)
 
 
@@ -165,7 +181,7 @@ def test_agent_isolates_downloads_and_packages_only_successes(tmp_path):
         assert archive.read("good.pdf") == b"%PDF-content"
     assert not client.destination.exists()
     assert "Failed document attempts (after retry): 1" in email.replies[0][1]
-    assert "attached as a ZIP" in email.replies[0][1]
+    assert "This reply contains a ZIP with 1 file" in email.replies[0][1]
 
 
 @pytest.mark.parametrize("available, failed", [(6, False), (0, False), (6, True)])
@@ -228,7 +244,7 @@ def test_zip_cli_packages_successes_or_reports_no_zip(
         assert len(archives) == 1
         with ZipFile(archives[0]) as archive:
             assert archive.namelist() == ["first.pdf"]
-        assert "Successfully downloaded 1 of 6 Exhibits" in output
+        assert "I downloaded 1 of 6 Exhibits" in output
         assert f"ZIP: {archives[0]}" in output
     else:
         assert not archives
@@ -294,3 +310,25 @@ except KeyboardInterrupt:
         if child.poll() is None:
             child.kill()
             child.communicate(timeout=5)
+
+
+def test_summary_does_not_confuse_final_filing_with_decision_or_invent_values():
+    from datetime import date
+
+    from src.agent import format_summary
+    from src.models import ProcessingResult
+
+    metadata = MatterMetadata(
+        "M54321",
+        title="Project valued at $42,000",
+        filing_dates={"Final Filing Date": date(2025, 1, 8)},
+        counts={DocumentType.EXHIBITS: 2},
+    )
+    body = format_summary(ProcessingResult(1, 2, metadata), DocumentType.EXHIBITS)
+    assert "concerns Project valued at $42,000." in body
+    assert "final filing date is January 8, 2025" in body
+    assert "decision" not in body.lower()
+    assert "status" not in body.lower()
+    assert "an unknown number of Key Documents" in body
+    assert "No ZIP is attached" in body
+    assert "attached as" not in body

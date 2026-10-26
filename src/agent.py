@@ -10,12 +10,12 @@ from tempfile import TemporaryDirectory
 
 from src.email_client import (
     AlreadyHandled,
-    AttachmentTooLarge,
     AuthenticationRequired,
     DeliveryUncertain,
     EmailClient,
     GmailError,
     MessageStore,
+    PreparedReply,
 )
 from src.models import DocumentType, IncomingEmail, ParsedRequest, ParseResult, ProcessingResult
 from src.packager import Packager
@@ -28,6 +28,7 @@ def format_summary(
     document_type: DocumentType | None = None,
     *,
     archive_attached: bool = False,
+    delivery_pending: bool = False,
 ) -> str:
     """Pure email body; errors count documents exhausted after the downloader's retry.
 
@@ -38,33 +39,68 @@ def format_summary(
         raise ValueError("cannot attach an archive with no downloaded files")
     metadata = result.metadata
     category = document_type.value if document_type else "documents (category unspecified)"
-    lines = ["Hi,", "", f"Matter: {metadata.matter_id}", f"Title: {metadata.title or 'Unknown'}"]
-    for label, value in (
-        ("Category", metadata.category),
-        ("Matter type", metadata.matter_type),
-        ("Status", metadata.status),
-        ("Outcome", metadata.outcome),
-    ):
-        if value:
-            lines.append(f"{label}: {value}")
-    lines.extend(
-        f"{label}: {value.isoformat()}" for label, value in sorted(metadata.filing_dates.items())
+    description = (
+        f"Matter {metadata.matter_id} concerns {metadata.title.rstrip('.')}."
+        if metadata.title
+        else f"Matter {metadata.matter_id} is listed in the UARB database."
     )
-    lines.extend(["", "Database document counts:"])
+    if metadata.matter_type and metadata.category:
+        description += (
+            f" It falls under {metadata.matter_type} in the {metadata.category} category."
+        )
+    elif metadata.category:
+        description += f" It is in the {metadata.category} category."
+    elif metadata.matter_type:
+        description += f" Its type is {metadata.matter_type}."
+    if metadata.status:
+        description += f" Its status is {metadata.status}."
+    months = (
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    )
+    for label, value in sorted(metadata.filing_dates.items()):
+        rendered = f"{months[value.month - 1]} {value.day}, {value.year}"
+        normalized = label.casefold().strip()
+        if normalized in {"received", "date received"}:
+            description += f" The matter was received on {rendered}."
+        elif normalized in {"decision", "decision date"}:
+            description += f" Its decision was issued on {rendered}."
+        else:
+            description += f" The recorded {label.lower()} is {rendered}."
+    if metadata.outcome:
+        description += f" The recorded outcome is {metadata.outcome.rstrip('.')}."
+    counts = []
     for item in DocumentType:
         count = metadata.counts.get(item)
-        lines.append(f"{item.value}: {count if count is not None else 'Unknown'}")
-    lines.extend(["", f"Requested category: {category}"])
-    lines.append(
-        f"Successfully downloaded {result.downloaded_count} of {result.available_count} {category}."
-    )
+        amount = "an unknown number of" if count is None else ("no" if count == 0 else str(count))
+        counts.append(f"{amount} {item.value}")
+    count_sentence = ", ".join(counts[:-1]) + ", and " + counts[-1]
+    lines = [
+        "Hi,",
+        "",
+        description,
+        "",
+        f"The database lists {count_sentence}.",
+        "",
+        f"I downloaded {result.downloaded_count} of {result.available_count} {category}.",
+    ]
     if result.available_count == 0:
         lines.append("No files are available in the requested category. No ZIP is attached.")
     elif result.downloaded_count == 0:
         lines.append("No files were downloaded. No ZIP is attached.")
     elif archive_attached:
-        lines.append("The downloaded files are attached as a ZIP.")
-    else:
+        lines.append("This reply contains the downloaded files attached as a ZIP file.")
+    elif not delivery_pending:
         lines.append("No ZIP is attached.")
     if result.errors:
         lines.append(f"Failed document attempts (after retry): {len(result.errors)}.")
@@ -97,6 +133,9 @@ class Agent:
     ) -> ParseResult | ProcessingResult | None:
         pending = None
         if self.store is not None:
+            if self.store.status(incoming.message_id) == "delivering":
+                self.email.resume_delivery(incoming)
+                return None
             if self.store.status(incoming.message_id) is not None:
                 raise AlreadyHandled("Message already handled or awaiting delivery review")
             pending = self.store.pending(incoming.thread_id, incoming.sender)
@@ -161,7 +200,7 @@ class Agent:
             return parsed
         request = parsed.require_request()
         try:
-            result, attachment = self._retrieve(request, workspace)
+            result, delivery = self._retrieve(request, workspace, incoming)
         except LookupError:
             self._send(
                 incoming,
@@ -182,24 +221,10 @@ class Agent:
                 status="retry",
             )
             return None
-        try:
-            self._send(
-                incoming,
-                format_summary(
-                    result,
-                    request.document_type,
-                    archive_attached=attachment is not None,
-                ),
-                attachment,
-            )
-        except AttachmentTooLarge:
-            self._send(
-                incoming,
-                format_summary(result, request.document_type)
-                + "\n\nThe ZIP exceeds the safe email attachment size limit. "
-                "No attachment was sent. Please contact the agent operator "
-                "for a smaller document set.",
-            )
+        if delivery:
+            self.email.send_delivery(incoming, delivery)
+        else:
+            self._send(incoming, format_summary(result, request.document_type))
         return result
 
     def _send(
@@ -217,8 +242,8 @@ class Agent:
         self.email.send_reply(incoming, body, attachment)
 
     def _retrieve(
-        self, request: ParsedRequest, workspace: Path
-    ) -> tuple[ProcessingResult, Path | None]:
+        self, request: ParsedRequest, workspace: Path, incoming: IncomingEmail
+    ) -> tuple[ProcessingResult, tuple[PreparedReply, ...] | None]:
         metadata = self.uarb.get_matter(request.matter_id)
         if metadata.matter_id != request.matter_id:
             raise ValueError("retrieved metadata does not match requested matter")
@@ -243,12 +268,18 @@ class Agent:
                 metadata=metadata,
                 errors=downloads.errors if downloads else (),
             )
-            attachment = (
-                self.packager.package(downloads.files, workspace / f"{request.matter_id}.zip")
+            delivery = (
+                self.email.prepare_delivery(
+                    incoming,
+                    format_summary(result, request.document_type, delivery_pending=True),
+                    downloads.files,
+                    self.packager,
+                    Path(temporary) / "batches",
+                )
                 if downloads and downloads.files
                 else None
             )
-        return result, attachment
+        return result, delivery
 
 
 def run_polling(agent: Agent, workspace: Path, interval: int = 15, *, once: bool = False) -> int:
@@ -271,13 +302,17 @@ def run_polling(agent: Agent, workspace: Path, interval: int = 15, *, once: bool
         completed = 0
         while True:
             try:
-                messages = agent.email.receive()
+                messages = agent.email.store.resumable() + agent.email.receive()
                 for message in messages:
-                    if agent.email.store.status(message.message_id) is not None:
+                    status = agent.email.store.status(message.message_id)
+                    if status not in {None, "delivering"}:
                         continue
                     with TemporaryDirectory(prefix="request-", dir=workspace) as temporary:
                         try:
-                            agent.process(message, Path(temporary))
+                            if status == "delivering":
+                                agent.email.resume_delivery(message)
+                            else:
+                                agent.process(message, Path(temporary))
                             completed += 1
                         except AlreadyHandled:
                             continue
