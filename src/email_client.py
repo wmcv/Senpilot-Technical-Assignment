@@ -31,7 +31,7 @@ from httplib2 import Http
 
 from src.config import Config
 from src.models import DocumentError, DocumentType, IncomingEmail, ParseResult
-from src.packager import Packager
+from src.packager import Packager, ZipBatch
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
@@ -65,6 +65,7 @@ class AlreadyHandled(GmailError):
 class PreparedReply:
     raw: bytes
     filenames: tuple[str, ...] = ()
+    errors: tuple[DocumentError, ...] = ()
 
 
 class MessageStore:
@@ -115,6 +116,11 @@ class MessageStore:
                 "CREATE TABLE IF NOT EXISTS delivery_parts ("
                 "message_id TEXT, part INTEGER, raw BLOB, filenames TEXT NOT NULL, "
                 "status TEXT NOT NULL, reply_id TEXT, PRIMARY KEY(message_id, part))"
+            )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS delivery_errors ("
+                "message_id TEXT, document TEXT, error TEXT, "
+                "PRIMARY KEY(message_id, document, error))"
             )
             self.cutoff_ms = int(
                 db.execute("SELECT value FROM settings WHERE key='cutoff_ms'").fetchone()[0]
@@ -173,6 +179,14 @@ class MessageStore:
                         for index, part in enumerate(parts, 1)
                     ],
                 )
+                db.executemany(
+                    "INSERT OR IGNORE INTO delivery_errors VALUES (?, ?, ?)",
+                    [
+                        (original.message_id, error.document, error.error)
+                        for part in parts
+                        for error in part.errors
+                    ],
+                )
         except sqlite3.IntegrityError:
             raise AlreadyHandled("Delivery already staged") from None
 
@@ -183,6 +197,13 @@ class MessageStore:
                 "WHERE m.status='delivering' ORDER BY d.rowid"
             ).fetchall()
         return [IncomingEmail(**json.loads(row[0])) for row in rows]
+
+    def record_errors(self, message_id: str, errors: tuple[DocumentError, ...]) -> None:
+        with self.connect() as db:
+            db.executemany(
+                "INSERT OR IGNORE INTO delivery_errors VALUES (?, ?, ?)",
+                [(message_id, error.document, error.error) for error in errors],
+            )
 
     def parts(self, message_id: str, *, include_payload: bool = True) -> list[tuple]:
         payload = "raw" if include_payload else "NULL"
@@ -440,7 +461,7 @@ def build_reply(
     original: IncomingEmail,
     body: str,
     mailbox: str,
-    attachment: Path | None = None,
+    attachment: Path | tuple[Path, ...] | None = None,
     *,
     part: tuple[int, int] | None = None,
 ) -> EmailMessage:
@@ -463,7 +484,8 @@ def build_reply(
     message["Message-ID"] = f"<senpilot-{digest}@{mailbox.split('@')[-1]}>"
     message["Auto-Submitted"] = "auto-replied"
     message.set_content(body)
-    if attachment:
+    attachments = (attachment,) if isinstance(attachment, Path) else (attachment or ())
+    for attachment in attachments:
         # Read at most the limit + 1 bytes, even if the file changes after stat().
         if attachment.stat().st_size > MAX_ATTACHMENT_BYTES:
             raise AttachmentTooLarge("ZIP attachment exceeds the safe email size limit")
@@ -625,75 +647,148 @@ class EmailClient:
         files: tuple[Path, ...],
         packager: Packager,
         directory: Path,
+        *,
+        matter_id: str | None = None,
+        document_type: DocumentType | None = None,
+        errors: tuple[DocumentError, ...] = (),
     ) -> tuple[PreparedReply, ...]:
-        """Fit verified ZIPs into complete MIME messages, including all headers/body.
+        """Prepare complete messages; prefer one, then first-fit decreasing ZIP groups.
 
-        Probe with an upper-bound report for ten files/parts and every possible
-        undeliverable filename. Final messages are checked again before staging.
+        Each fit check serializes the entire MIME message. Bodies for follow-ups
+        are deliberately short; only the first reply carries the matter summary.
         """
         if len(files) > 10:
             raise ValueError("at most ten downloaded files may be delivered")
         mailbox = self.config.agent_email
-        names = tuple(path.name for path in files)
+        category = document_type.value if document_type else "documents"
+        context = f"{category} for matter {matter_id}" if matter_id else category
+        signoff = "\n\nBest,\nSenpilot Document Agent"
+        failures: tuple[DocumentError, ...] = ()
 
-        def body(index, total, members, before_files, before_parts, deliverable, failures):
-            unit = "file" if len(members) == 1 else "files"
-            details = (
-                f"Part {index} of {total}. This reply contains a ZIP with {len(members)} {unit}: "
-                + ", ".join(members)
-                + f".\nPreviously accepted attachments: {before_files} files in {before_parts} "
-                f"parts. Files prepared for delivery: {deliverable}."
-            )
-            if failures:
-                details += f"\nUndeliverable files: {len(failures)}.\n" + "\n".join(
-                    f"Undeliverable [{error.document}]: {error.error}." for error in failures
+        def body(index, total, members, deliverable):
+            unit = "document" if members == 1 else "documents"
+            if index > 1:
+                sentence = (
+                    f"Attached is the final set of {context} ({members} {unit})."
+                    if index == total
+                    else "Following up on my previous email, I've attached the next set of "
+                    f"{context} ({members} {unit})."
                 )
-            return summary.removesuffix("\n\nBest,\nSenpilot Document Agent") + (
-                f"\n\n{details}\n\nBest,\nSenpilot Document Agent"
+                return f"Hi,\n\n{sentence}{signoff}"
+            text = summary.removesuffix(signoff)
+            if total > 1:
+                included = (
+                    f"all {deliverable} retrieved documents"
+                    if deliverable == len(files)
+                    else f"{deliverable} of the {len(files)} retrieved documents"
+                )
+                if members:
+                    text += f"\n\nI'll send {included} across {total} separate replies."
+                    amount = "document" if members == 1 else f"{members} documents"
+                    text += f" I've attached the first {amount} to this email."
+                else:
+                    following = (
+                        "a separate reply" if total == 2 else f"{total - 1} separate replies"
+                    )
+                    text += (
+                        f"\n\nI can send {included}. The attachments will follow in {following}."
+                    )
+            elif members:
+                if members == len(files):
+                    amount = (
+                        "the retrieved document"
+                        if members == 1
+                        else (f"all {members} retrieved documents")
+                    )
+                    text += f"\n\nI've attached {amount}."
+                else:
+                    text += f"\n\nI've attached {members} of the {len(files)} retrieved documents."
+            else:
+                text += "\n\nNone of the retrieved documents could be included."
+            oversized = sum(
+                error.error == "exceeds safe encoded message limit" for error in failures
+            )
+            if oversized and oversized == len(failures):
+                noun = "document" if oversized == 1 else "documents"
+                text += (
+                    f" {oversized} {noun} exceeded the email attachment limit "
+                    "and couldn't be included."
+                )
+            elif failures:
+                noun = "document" if len(failures) == 1 else "documents"
+                text += f" {len(failures)} {noun} could not be included"
+                if oversized:
+                    text += f", including {oversized} that exceeded the email attachment limit"
+                text += "."
+            return text + signoff
+
+        def message(group, index, total, deliverable):
+            return build_reply(
+                original,
+                body(index, total, sum(len(batch.filenames) for batch in group), deliverable),
+                mailbox,
+                tuple(batch.archive for batch in group),
+                part=(index, total),
             )
 
-        possible_failures = tuple(
-            DocumentError(name, "exceeds safe encoded message limit") for name in names
-        )
-
-        def fits(archive):
+        def fits_archive(archive):
+            # A file that cannot accompany the full summary may still fit in a
+            # short follow-up. The first reply can carry just the summary then.
             try:
-                build_reply(
-                    original,
-                    body(10, 10, names, 10, 10, 10, possible_failures),
-                    mailbox,
-                    archive,
-                    part=(10, 10),
-                )
+                build_reply(original, body(2, 3, 10, 10), mailbox, archive, part=(2, 3))
             except AttachmentTooLarge:
                 return False
             return True
 
-        batches, failures = packager.batches(files, directory, fits)
-        if not batches:
-            report = summary.removesuffix("\n\nBest,\nSenpilot Document Agent")
-            report += "\n\nNo ZIP is attached. Accepted attachments: 0 files."
-            if failures:
-                report += f"\nUndeliverable files: {len(failures)}.\n" + "\n".join(
-                    f"Undeliverable [{error.document}]: {error.error}." for error in failures
-                )
-            report += "\n\nBest,\nSenpilot Document Agent"
-            return (PreparedReply(build_reply(original, report, mailbox).as_bytes()),)
-        prepared = []
-        accepted = 0
+        batches, failures = packager.batches(files, directory, fits_archive)
         deliverable = sum(len(batch.filenames) for batch in batches)
-        for index, batch in enumerate(batches, 1):
-            message = build_reply(
-                original,
-                body(
-                    index, len(batches), batch.filenames, accepted, index - 1, deliverable, failures
-                ),
-                mailbox,
-                batch.archive,
-                part=(index, len(batches)),
-            )
-            prepared.append(PreparedReply(message.as_bytes(), batch.filenames))
-            accepted += len(batch.filenames)
+
+        def fits(group, index, total):
+            # Base64 alone is a cheap lower bound; accepted groups still pass
+            # the full MIME check, including text, headers and attachment framing.
+            if sum(4 * ((batch.archive.stat().st_size + 2) // 3) for batch in group) > (
+                MAX_MESSAGE_BYTES
+            ):
+                return False
+            try:
+                message(group, index, total, deliverable)
+            except AttachmentTooLarge:
+                return False
+            return True
+
+        if fits(batches, 1, 1):
+            groups = [list(batches)]
+        else:
+            groups: list[list[ZipBatch]] = [[]]
+            # At most ten ZIPs plus a summary-only first email. This two-digit
+            # count conservatively sizes the first email until grouping is known.
+            for batch in sorted(
+                batches, key=lambda item: item.archive.stat().st_size, reverse=True
+            ):
+                for index, group in enumerate(groups, 1):
+                    if fits([*group, batch], index, 11):
+                        group.append(batch)
+                        break
+                else:
+                    groups.append([batch])
+            # Shorter final bodies or the final email count may permit a merge.
+            while True:
+                merged = False
+                for first in range(len(groups)):
+                    for second in range(first + 1, len(groups)):
+                        if fits(groups[first] + groups[second], first + 1, len(groups) - 1):
+                            groups[first].extend(groups.pop(second))
+                            merged = True
+                            break
+                    if merged:
+                        break
+                if not merged:
+                    break
+        prepared = []
+        for index, group in enumerate(groups, 1):
+            raw = message(group, index, len(groups), deliverable).as_bytes()
+            names = tuple(name for batch in group for name in batch.filenames)
+            prepared.append(PreparedReply(raw, names, (*errors, *failures) if index == 1 else ()))
         return tuple(prepared)
 
     def send_delivery(self, original: IncomingEmail, parts: tuple[PreparedReply, ...]) -> None:

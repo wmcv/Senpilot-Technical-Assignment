@@ -77,7 +77,7 @@ def test_partial_download_reports_errors_and_caps_limit(tmp_path):
     assert packager.files[0].name == "a.pdf"
     assert packager.files[0].parent.parent == tmp_path
     assert not packager.files[0].parent.exists()
-    assert "Error [b.pdf]: failed" in email.replies[0][1]
+    assert "I couldn't retrieve 1 requested document" in email.replies[0][1]
     from zipfile import ZipFile
 
     with ZipFile(email.replies[0][2]) as archive:
@@ -131,8 +131,8 @@ def test_summary_is_deterministic_and_uses_metadata():
         "no Recordings",
     ):
         assert value in body
-    assert "I downloaded 10 of 43 Other Documents." in body
-    assert "Failed document attempts (after retry): 2." in body
+    assert "I retrieved 10 of 43 Other Documents." in body
+    assert "I couldn't retrieve 2 requested documents." in body
     assert "attached as a ZIP" in body
     assert body == format_summary(result, DocumentType.OTHER_DOCUMENTS, archive_attached=True)
 
@@ -143,7 +143,7 @@ def test_summary_is_deterministic_and_uses_metadata():
         (0, 0, (), "No files are available"),
         (6, 0, (DocumentError("a.pdf", "failed"),), "No files were downloaded"),
         (6, 0, (), "No files were downloaded"),
-        (6, 1, (DocumentError("a.pdf", "failed"),), "I downloaded 1 of 6"),
+        (6, 1, (DocumentError("a.pdf", "failed"),), "I retrieved 1 of 6"),
     ],
 )
 def test_summary_zero_and_partial(available, downloaded, errors, expected):
@@ -157,8 +157,8 @@ def test_summary_zero_and_partial(available, downloaded, errors, expected):
     assert expected in body
     assert "No ZIP is attached" in body
     assert "is listed in the UARB database" in body
-    assert "an unknown number of Exhibits" in body
-    assert ("Failed document attempts" in body) == bool(errors)
+    assert "Counts for the remaining categories are unavailable" in body
+    assert ("couldn't retrieve" in body) == bool(errors)
 
 
 def test_agent_isolates_downloads_and_packages_only_successes(tmp_path):
@@ -180,8 +180,8 @@ def test_agent_isolates_downloads_and_packages_only_successes(tmp_path):
         assert archive.namelist() == ["good.pdf"]
         assert archive.read("good.pdf") == b"%PDF-content"
     assert not client.destination.exists()
-    assert "Failed document attempts (after retry): 1" in email.replies[0][1]
-    assert "This reply contains a ZIP with 1 file" in email.replies[0][1]
+    assert "I couldn't retrieve 1 requested document" in email.replies[0][1]
+    assert "I've attached the retrieved document" in email.replies[0][1]
 
 
 @pytest.mark.parametrize("available, failed", [(6, False), (0, False), (6, True)])
@@ -244,13 +244,13 @@ def test_zip_cli_packages_successes_or_reports_no_zip(
         assert len(archives) == 1
         with ZipFile(archives[0]) as archive:
             assert archive.namelist() == ["first.pdf"]
-        assert "I downloaded 1 of 6 Exhibits" in output
+        assert "I retrieved 1 of 6 Exhibits" in output
         assert f"ZIP: {archives[0]}" in output
     else:
         assert not archives
         assert "No files are available" in output
         assert "ZIP: none" in output
-    assert ("Failed document attempts (after retry): 1" in output) == failed
+    assert ("I couldn't retrieve 1 requested document" in output) == failed
 
 
 def test_sigterm_unwinds_cleanup_and_restores_previous_handler(tmp_path):
@@ -329,6 +329,6 @@ def test_summary_does_not_confuse_final_filing_with_decision_or_invent_values():
     assert "final filing date is January 8, 2025" in body
     assert "decision" not in body.lower()
     assert "status" not in body.lower()
-    assert "an unknown number of Key Documents" in body
+    assert "Counts for the remaining categories are unavailable" in body
     assert "No ZIP is attached" in body
     assert "attached as" not in body

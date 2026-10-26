@@ -467,12 +467,12 @@ def test_complete_mocked_workflow_preserves_zip_and_failures(
         )
     )
     body = reply.get_body().get_content()
-    assert "I downloaded 1 of 5 Key Documents" in body
-    assert "Failed document attempts (after retry): 1" in body
+    assert "I retrieved 1 of 5 Key Documents" in body
+    assert "I couldn't retrieve 1 requested document" in body
     attachments = list(reply.iter_attachments())
     if oversized:
         assert not attachments
-        assert "exceeds safe encoded message limit" in body
+        assert "exceeded the email attachment limit" in body
         assert "attached as a ZIP" not in body
     else:
         assert attachments[0].get_payload(decode=True) == packager.verified
@@ -567,7 +567,15 @@ def prepare_small_parts(client, tmp_path, monkeypatch, count=3):
         count, 13, MatterMetadata("M12205", counts={DocumentType.EXHIBITS: 13})
     )
     summary = format_summary(result, DocumentType.EXHIBITS, delivery_pending=True)
-    parts = client.prepare_delivery(incoming(), summary, tuple(files), Packager(), tmp_path / "zip")
+    parts = client.prepare_delivery(
+        incoming(),
+        summary,
+        tuple(files),
+        Packager(),
+        tmp_path / "zip",
+        matter_id="M12205",
+        document_type=DocumentType.EXHIBITS,
+    )
     assert len(parts) == count
     return parts, files
 
@@ -590,10 +598,20 @@ def test_multipart_mime_size_threading_receipts_and_counts(client, service, tmp_
         assert message["In-Reply-To"] == incoming().rfc_message_id
         assert message["References"] == "<ancestor@example.net> <original@example.net>"
         body = message.get_body().get_content()
-        assert f"Part {index} of 3" in body
-        assert f"Previously accepted attachments: {index - 1} files" in body
-        assert "I downloaded 3 of 13 Exhibits" in body
-        assert "Files prepared for delivery: 3" in body
+        if index == 1:
+            assert "I retrieved 3 of 13 Exhibits" in body
+            assert "all 3 retrieved documents across 3 separate replies" in body
+            assert "I've attached the first document" in body
+        else:
+            assert "database" not in body.lower()
+            assert "retrieved" not in body.lower()
+            assert "13 Exhibits" not in body
+            assert len(body.splitlines()) <= 8
+            assert "Exhibits for matter M12205" in body
+            assert ("final set" in body) == (index == 3)
+            assert ("previous email" in body) == (index == 2)
+        for technical in ("MIME", "encoded", "receipts", "prepared", "Part "):
+            assert technical not in body
         attachments = list(message.iter_attachments())
         assert len(attachments) == 1
         with ZipFile(BytesIO(attachments[0].get_payload(decode=True))) as archive:
@@ -651,12 +669,21 @@ def test_unfit_and_invalid_pdfs_reported_without_blocking_other_files(
     message = decode_reply(parts[0].raw)
     assert len(list(message.iter_attachments())) == 1
     body = message.get_body().get_content()
-    assert "Undeliverable files: 3" in body
-    assert "Undeliverable [huge.pdf]: exceeds safe encoded message limit" in body
-    assert "Undeliverable [error.pdf]: invalid PDF signature" in body
-    assert "Undeliverable [empty.pdf]: download source is empty" in body
-    assert "Previously accepted attachments: 0 files" in body
-    assert "Files prepared for delivery: 1" in body
+    assert "1 of the 4 retrieved documents" in body
+    assert (
+        "3 documents could not be included, including 1 that exceeded the email attachment limit"
+        in (body)
+    )
+    assert all(path.name not in body for path in files)
+    assert {(error.document, error.error) for error in parts[0].errors} == {
+        ("huge.pdf", "exceeds safe encoded message limit"),
+        ("error.pdf", "invalid PDF signature"),
+        ("empty.pdf", "download source is empty"),
+    }
+    client.send_delivery(incoming(), parts)
+    with client.store.connect() as db:
+        diagnostics = db.execute("SELECT document, error FROM delivery_errors").fetchall()
+    assert set(diagnostics) == {(error.document, error.error) for error in parts[0].errors}
 
 
 @pytest.mark.parametrize(
@@ -848,11 +875,20 @@ def test_all_ten_files_can_be_delivered_with_partial_download_errors(
         base64.urlsafe_b64decode(service.users().messages().send.call_args.kwargs["body"]["raw"])
     )
     body = message.get_body().get_content()
-    assert "I downloaded 10 of 13 Exhibits" in body
-    assert "Failed document attempts (after retry): 2" in body
-    assert "Previously accepted attachments: 9 files" in body
-    assert "This reply contains a ZIP with 1 file" in body
-    assert "Files prepared for delivery: 10" in body
+    assert "Attached is the final set of Exhibits for matter M12205" in body
+    assert "retrieved" not in body
+    payloads = [
+        call.kwargs["body"]
+        for call in service.users().messages().send.call_args_list
+        if "body" in call.kwargs
+    ]
+    first_body = decode_reply(base64.urlsafe_b64decode(payloads[0]["raw"])).get_body().get_content()
+    assert "I retrieved 10 of 13 Exhibits" in first_body
+    assert "I couldn't retrieve 2 requested documents" in first_body
+    assert "10 separate replies" in first_body
+    assert "failed-1.pdf" not in first_body
+    with client.store.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM delivery_errors").fetchone()[0] == 2
     assert client.store.status("message-1") == "processed"
     assert not list((tmp_path / "work").iterdir())
 
@@ -873,5 +909,282 @@ def test_multiple_documents_are_grouped_when_the_encoded_message_fits(
     assert len(combined) == 1
     assert combined[0].filenames == ("file-0.pdf", "file-1.pdf")
     body = decode_reply(combined[0].raw).get_body().get_content()
-    assert "Part 1 of 1" in body
-    assert "ZIP with 2 files" in body
+    assert "I've attached all 2 retrieved documents" in body
+    assert "separate replies" not in body
+    assert "attachment limit" not in body
+    assert "Part " not in body
+
+
+def prepare_multi_zip_delivery(client, tmp_path, monkeypatch, *, count=2, message_limit=15000):
+    """Force small individual ZIPs, independent of the larger whole-message limit."""
+    import random
+
+    from src.agent import format_summary
+    from src.models import ProcessingResult
+
+    monkeypatch.setattr("src.email_client.MAX_ATTACHMENT_BYTES", 3500)
+    monkeypatch.setattr("src.email_client.MAX_MESSAGE_BYTES", message_limit)
+    rng = random.Random(61)
+    sources = []
+    for index in range(count):
+        source = tmp_path / f"document-{index}.pdf"
+        source.write_bytes(b"%PDF-1.7\n" + rng.randbytes(3000))
+        sources.append(source)
+    result = ProcessingResult(
+        count,
+        13,
+        MatterMetadata("M12205", title="Water project", counts={DocumentType.EXHIBITS: 13}),
+    )
+    prepared = client.prepare_delivery(
+        incoming(),
+        format_summary(result, DocumentType.EXHIBITS, delivery_pending=True),
+        tuple(sources),
+        Packager(),
+        tmp_path / "archives",
+        matter_id="M12205",
+        document_type=DocumentType.EXHIBITS,
+    )
+    return prepared, sources
+
+
+def test_multiple_verified_zips_share_one_email_and_one_receipt(
+    client, service, tmp_path, monkeypatch
+):
+    import json
+    from io import BytesIO
+    from zipfile import ZipFile
+
+    parts, sources = prepare_multi_zip_delivery(client, tmp_path, monkeypatch)
+    assert len(parts) == 1
+    reply = decode_reply(parts[0].raw)
+    attachments = list(reply.iter_attachments())
+    assert len(attachments) == 2
+    contents = {}
+    for attachment in attachments:
+        data = attachment.get_payload(decode=True)
+        assert len(data) <= 3500
+        with ZipFile(BytesIO(data)) as archive:
+            assert archive.testzip() is None
+            contents.update({name: archive.read(name) for name in archive.namelist()})
+    assert contents == {source.name: source.read_bytes() for source in sources}
+    body = reply.get_body().get_content()
+    assert "I retrieved 2 of 13 Exhibits" in body
+    assert "I've attached all 2 retrieved documents" in body
+    for unwanted in ("separate replies", "attachment limit", "MIME", "receipts", "Part "):
+        assert unwanted not in body
+    service.users().messages().send.reset_mock()
+    client.send_delivery(incoming(), parts)
+    assert service.users().messages().send.call_count == 1
+    row = client.store.parts("message-1")[0]
+    assert json.loads(row[2]) == [source.name for source in sources]
+    assert row[3:] == ("accepted", "reply-id")
+
+
+def test_multiple_zips_split_by_complete_mime_size_not_combined_raw_size(
+    client, tmp_path, monkeypatch
+):
+    parts, _ = prepare_multi_zip_delivery(client, tmp_path, monkeypatch, message_limit=7500)
+    assert len(parts) == 2
+    messages = [decode_reply(part.raw) for part in parts]
+    raw_zip_bytes = sum(
+        len(attachment.get_payload(decode=True))
+        for message in messages
+        for attachment in message.iter_attachments()
+    )
+    assert raw_zip_bytes < 7500  # Raw files fit; their complete encoded envelope does not.
+    assert all(len(part.raw) <= 7500 for part in parts)
+    first, final = [message.get_body().get_content() for message in messages]
+    assert "across 2 separate replies" in first
+    assert "Attached is the final set of Exhibits for matter M12205" in final
+    assert "Water project" not in final
+    assert "database" not in final
+
+
+def test_multi_attachment_mime_exact_size_boundary(tmp_path, monkeypatch):
+    paths = tuple(tmp_path / f"{index}.zip" for index in range(2))
+    for path in paths:
+        path.write_bytes(b"zip fixture")
+    reply = build_reply(incoming(), "Two attachments", "agent@example.com", paths)
+    exact = len(reply.as_bytes())
+    monkeypatch.setattr("src.email_client.MAX_MESSAGE_BYTES", exact)
+    assert len(
+        build_reply(incoming(), "Two attachments", "agent@example.com", paths).as_bytes()
+    ) == (exact)
+    monkeypatch.setattr("src.email_client.MAX_MESSAGE_BYTES", exact - 1)
+    with pytest.raises(AttachmentTooLarge):
+        build_reply(incoming(), "Two attachments", "agent@example.com", paths)
+
+
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_multi_attachment_restart_keeps_messages_and_completed_receipts(
+    client, config, service, tmp_path, monkeypatch, uncertain
+):
+    import shutil
+
+    parts, sources = prepare_multi_zip_delivery(
+        client, tmp_path, monkeypatch, count=4, message_limit=10000
+    )
+    assert len(parts) == 2
+    assert [len(list(decode_reply(part.raw).iter_attachments())) for part in parts] == [2, 2]
+    api = service.users().messages()
+    error = (
+        OSError("private transport error")
+        if uncertain
+        else HttpError(httplib2.Response({"status": "403"}), b"private provider response")
+    )
+    api.send().execute.side_effect = [{"id": "first-receipt"}, error]
+    with pytest.raises(DeliveryUncertain if uncertain else GmailError):
+        client.send_delivery(incoming(), parts)
+    for source in sources:
+        source.unlink()
+    shutil.rmtree(tmp_path / "archives")
+    restarted = EmailClient(config, service=service, state_path=client.state_path)
+    api.send.reset_mock()
+    if uncertain:
+        assert restarted.store.resumable() == []
+        with pytest.raises(AlreadyHandled):
+            restarted.resume_delivery(incoming())
+        api.send.assert_not_called()
+    else:
+        api.send().execute.side_effect = [{"id": "final-receipt"}]
+        api.send.reset_mock()
+        restarted.resume_delivery(restarted.store.resumable()[0])
+        assert api.send.call_count == 1
+        payload = api.send.call_args.kwargs["body"]
+        assert payload["threadId"] == incoming().thread_id
+        assert base64.urlsafe_b64decode(payload["raw"]) == parts[1].raw
+        assert len(list(decode_reply(parts[1].raw).iter_attachments())) == 2
+        assert restarted.store.status("message-1") == "processed"
+    assert restarted.store.parts("message-1")[0][4] == "first-receipt"
+
+
+def test_all_four_documents_too_large_produces_one_plain_language_reply(
+    client, tmp_path, monkeypatch
+):
+    import random
+
+    rng = random.Random(4)
+    monkeypatch.setattr("src.email_client.MAX_MESSAGE_BYTES", 7500)
+    files = []
+    for index in range(4):
+        path = tmp_path / f"private-{index}.pdf"
+        path.write_bytes(b"%PDF-" + rng.randbytes(10000))
+        files.append(path)
+    parts = client.prepare_delivery(
+        incoming(),
+        "Hi,\n\nI retrieved 4 of 13 Exhibits.",
+        tuple(files),
+        Packager(),
+        tmp_path / "batches",
+        matter_id="M12205",
+        document_type=DocumentType.EXHIBITS,
+    )
+    assert len(parts) == 1
+    reply = decode_reply(parts[0].raw)
+    assert not list(reply.iter_attachments())
+    body = reply.get_body().get_content()
+    assert "None of the retrieved documents could be included" in body
+    assert "4 documents exceeded the email attachment limit and couldn't be included" in body
+    assert "separate replies" not in body
+    assert "I've attached" not in body
+    assert all(source.name not in body for source in files)
+    assert len(parts[0].errors) == 4
+
+
+def test_zero_retrieval_errors_remain_internal_without_exposing_filenames(
+    client, service, tmp_path
+):
+    from dataclasses import replace
+
+    from src.models import DocumentError, DownloadResult
+
+    class FailedMatter:
+        def get_matter(self, matter_id):
+            return MatterMetadata(matter_id, counts={DocumentType.EXHIBITS: 3})
+
+        def download_documents(self, *args, **kwargs):
+            return DownloadResult(errors=(DocumentError("private.pdf", "technical diagnostic"),))
+
+    result = Agent(FailedMatter(), Packager(), client, store=client.store).process(
+        replace(incoming(), body="M12205 Exhibits"), tmp_path
+    )
+    assert result.downloaded_count == 0
+    reply = decode_reply(
+        base64.urlsafe_b64decode(service.users().messages().send.call_args.kwargs["body"]["raw"])
+    )
+    assert "couldn't retrieve 1 requested document" in reply.get_body().get_content()
+    assert "private.pdf" not in reply.get_body().get_content()
+    assert "technical diagnostic" not in reply.get_body().get_content()
+    assert not list(reply.iter_attachments())
+    with client.store.connect() as db:
+        assert db.execute("SELECT document, error FROM delivery_errors").fetchall() == [
+            ("private.pdf", "technical diagnostic")
+        ]
+
+
+def test_largest_first_zip_grouping_avoids_an_unnecessary_third_email(
+    client, tmp_path, monkeypatch
+):
+    import random
+
+    from src.packager import ZipBatch
+
+    class IndividualZips(Packager):
+        def batches(self, files, directory, fits):
+            directory.mkdir()
+            return tuple(
+                ZipBatch(self.package((source,), directory / f"{index}.zip"), (source.name,))
+                for index, source in enumerate(files)
+            ), ()
+
+    monkeypatch.setattr("src.email_client.MAX_MESSAGE_BYTES", 8500)
+    rng = random.Random(99)
+    files = []
+    # Input-order grouping would put both small ZIPs together and need three replies.
+    for index, size in enumerate((2000, 2000, 3000, 3000)):
+        source = tmp_path / f"{index}.pdf"
+        source.write_bytes(b"%PDF-" + rng.randbytes(size))
+        files.append(source)
+    parts = client.prepare_delivery(
+        incoming(),
+        "Hi,\n\nDocuments for M12205.",
+        tuple(files),
+        IndividualZips(),
+        tmp_path / "zips",
+        matter_id="M12205",
+        document_type=DocumentType.EXHIBITS,
+    )
+    assert len(parts) == 2
+    assert [len(list(decode_reply(part.raw).iter_attachments())) for part in parts] == [2, 2]
+    assert all(len(part.raw) <= 8500 for part in parts)
+    assert sorted(name for part in parts for name in part.filenames) == [
+        path.name for path in files
+    ]
+
+
+def test_summary_can_precede_a_large_attachment_without_discarding_the_document(
+    client, tmp_path, monkeypatch
+):
+    import random
+
+    monkeypatch.setattr("src.email_client.MAX_MESSAGE_BYTES", 7500)
+    source = tmp_path / "large.pdf"
+    source.write_bytes(b"%PDF-" + random.Random(1).randbytes(4000))
+    parts = client.prepare_delivery(
+        incoming(),
+        "Hi,\n\n" + "Retrieved matter metadata. " * 100,
+        (source,),
+        Packager(),
+        tmp_path / "zips",
+        matter_id="M12205",
+        document_type=DocumentType.EXHIBITS,
+    )
+    assert len(parts) == 2
+    first, last = [decode_reply(part.raw) for part in parts]
+    assert not list(first.iter_attachments())
+    assert "The attachments will follow in a separate reply" in first.get_body().get_content()
+    assert "I've attached" not in first.get_body().get_content()
+    assert len(list(last.iter_attachments())) == 1
+    assert "final set of Exhibits for matter M12205" in last.get_body().get_content()
+    assert not parts[0].errors
+    assert parts[1].filenames == ("large.pdf",)

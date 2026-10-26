@@ -82,17 +82,26 @@ def format_summary(
     counts = []
     for item in DocumentType:
         count = metadata.counts.get(item)
-        amount = "an unknown number of" if count is None else ("no" if count == 0 else str(count))
-        counts.append(f"{amount} {item.value}")
-    count_sentence = ", ".join(counts[:-1]) + ", and " + counts[-1]
+        if count is not None:
+            counts.append(f"{'no' if count == 0 else count} {item.value}")
+    count_sentence = (
+        ", ".join(counts[:-1]) + ", and " + counts[-1]
+        if len(counts) > 1
+        else (counts[0] if counts else "")
+    )
+    count_summary = (
+        f"The database lists {count_sentence}." if counts else "Document counts are unavailable."
+    )
+    if counts and len(counts) < len(DocumentType):
+        count_summary += " Counts for the remaining categories are unavailable."
     lines = [
         "Hi,",
         "",
         description,
         "",
-        f"The database lists {count_sentence}.",
+        count_summary,
         "",
-        f"I downloaded {result.downloaded_count} of {result.available_count} {category}.",
+        f"I retrieved {result.downloaded_count} of {result.available_count} {category}.",
     ]
     if result.available_count == 0:
         lines.append("No files are available in the requested category. No ZIP is attached.")
@@ -103,8 +112,8 @@ def format_summary(
     elif not delivery_pending:
         lines.append("No ZIP is attached.")
     if result.errors:
-        lines.append(f"Failed document attempts (after retry): {len(result.errors)}.")
-        lines.extend(f"Error [{error.document}]: {error.error}" for error in result.errors)
+        noun = "document" if len(result.errors) == 1 else "documents"
+        lines.append(f"I couldn't retrieve {len(result.errors)} requested {noun}.")
     lines.extend(["", "Best,", "Senpilot Document Agent"])
     return "\n".join(lines)
 
@@ -224,6 +233,8 @@ class Agent:
         if delivery:
             self.email.send_delivery(incoming, delivery)
         else:
+            if self.store is not None:
+                self.store.record_errors(incoming.message_id, result.errors)
             self._send(incoming, format_summary(result, request.document_type))
         return result
 
@@ -275,6 +286,9 @@ class Agent:
                     downloads.files,
                     self.packager,
                     Path(temporary) / "batches",
+                    matter_id=request.matter_id,
+                    document_type=request.document_type,
+                    errors=result.errors,
                 )
                 if downloads and downloads.files
                 else None
